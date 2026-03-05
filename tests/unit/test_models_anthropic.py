@@ -56,6 +56,9 @@ from kiro.models_anthropic import (
     # Error models
     AnthropicErrorDetail,
     AnthropicErrorResponse,
+    # Sanitization helpers
+    _sanitize_content_blocks,
+    _sanitize_tool_result_content,
 )
 
 
@@ -1502,3 +1505,360 @@ class TestErrorModels:
         
         print(f"Comparing error.type: Got '{response.error.type}'")
         assert response.error.type == "authentication_error"
+
+
+# ==================================================================================================
+# Tests for Unknown Content Type Sanitization (tool_reference fix)
+# ==================================================================================================
+
+
+class TestSanitizeToolResultContent:
+    """Tests for _sanitize_tool_result_content helper function."""
+
+    def test_string_content_unchanged(self):
+        """
+        What it does: Verifies string content passes through unchanged.
+        Purpose: Ensure normal tool_result content is not modified.
+        """
+        result = _sanitize_tool_result_content("some text result")
+        assert result == "some text result"
+
+    def test_none_content_unchanged(self):
+        """
+        What it does: Verifies None content passes through unchanged.
+        Purpose: Ensure optional content is not modified.
+        """
+        result = _sanitize_tool_result_content(None)
+        assert result is None
+
+    def test_known_types_preserved(self):
+        """
+        What it does: Verifies known content types (text, image) are kept.
+        Purpose: Ensure sanitizer doesn't strip valid content.
+        """
+        content = [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+        ]
+        result = _sanitize_tool_result_content(content)
+        assert len(result) == 2
+        assert result[0]["type"] == "text"
+        assert result[1]["type"] == "image"
+
+    def test_tool_reference_stripped(self):
+        """
+        What it does: Verifies tool_reference blocks are removed.
+        Purpose: Core test for the fix — tool_reference must be stripped.
+        """
+        content = [
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "tool_reference", "tool_name": "Grep"},
+            {"type": "tool_reference", "tool_name": "Agent"},
+        ]
+        result = _sanitize_tool_result_content(content)
+        # All unknown types stripped, returns empty string fallback
+        assert result == ""
+
+    def test_mixed_known_and_unknown_types(self):
+        """
+        What it does: Verifies only unknown types are stripped in mixed content.
+        Purpose: Ensure known types survive alongside unknown ones.
+        """
+        content = [
+            {"type": "text", "text": "result data"},
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+        ]
+        result = _sanitize_tool_result_content(content)
+        assert len(result) == 2
+        assert result[0]["type"] == "text"
+        assert result[1]["type"] == "image"
+
+    def test_non_dict_items_preserved(self):
+        """
+        What it does: Verifies non-dict items in content list are kept.
+        Purpose: Defensive test for unexpected content formats.
+        """
+        content = ["plain string", {"type": "text", "text": "hello"}]
+        result = _sanitize_tool_result_content(content)
+        assert len(result) == 2
+        assert result[0] == "plain string"
+
+
+class TestSanitizeContentBlocks:
+    """Tests for _sanitize_content_blocks helper function."""
+
+    def test_string_content_unchanged(self):
+        """
+        What it does: Verifies string content passes through unchanged.
+        Purpose: Ensure simple string messages are not modified.
+        """
+        result = _sanitize_content_blocks("hello world")
+        assert result == "hello world"
+
+    def test_known_block_types_preserved(self):
+        """
+        What it does: Verifies all known block types are preserved.
+        Purpose: Ensure sanitizer doesn't strip valid content blocks.
+        """
+        content = [
+            {"type": "text", "text": "hello"},
+            {"type": "thinking", "thinking": "hmm", "signature": ""},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+            {"type": "tool_use", "id": "call_1", "name": "test", "input": {}},
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+        ]
+        result = _sanitize_content_blocks(content)
+        assert len(result) == 5
+
+    def test_unknown_top_level_type_stripped(self):
+        """
+        What it does: Verifies unknown types at top level are stripped.
+        Purpose: Ensure non-standard block types don't cause 422.
+        """
+        content = [
+            {"type": "text", "text": "hello"},
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "some_future_type", "data": "whatever"},
+        ]
+        result = _sanitize_content_blocks(content)
+        assert len(result) == 1
+        assert result[0]["type"] == "text"
+
+    def test_tool_result_nested_content_sanitized(self):
+        """
+        What it does: Verifies tool_reference inside tool_result.content is stripped.
+        Purpose: Core test — this is the exact scenario from the bug report.
+        """
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "tooluse_BRzw6tnDuahXyE0YtDfHWT",
+                "content": [
+                    {"type": "tool_reference", "tool_name": "Read"},
+                    {"type": "tool_reference", "tool_name": "Grep"},
+                    {"type": "tool_reference", "tool_name": "Agent"},
+                ],
+            }
+        ]
+        result = _sanitize_content_blocks(content)
+        assert len(result) == 1
+        assert result[0]["type"] == "tool_result"
+        # Nested tool_references all stripped, content becomes empty string
+        assert result[0]["content"] == ""
+
+    def test_tool_result_with_mixed_nested_content(self):
+        """
+        What it does: Verifies mixed nested content in tool_result is partially sanitized.
+        Purpose: Ensure valid nested content survives alongside unknown types.
+        """
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_123",
+                "content": [
+                    {"type": "text", "text": "actual result"},
+                    {"type": "tool_reference", "tool_name": "Read"},
+                ],
+            }
+        ]
+        result = _sanitize_content_blocks(content)
+        assert len(result) == 1
+        assert len(result[0]["content"]) == 1
+        assert result[0]["content"][0]["type"] == "text"
+
+    def test_tool_result_string_content_not_modified(self):
+        """
+        What it does: Verifies tool_result with string content is not modified.
+        Purpose: Ensure normal tool results pass through.
+        """
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_123",
+                "content": "plain text result",
+            }
+        ]
+        result = _sanitize_content_blocks(content)
+        assert result[0]["content"] == "plain text result"
+
+    def test_all_blocks_stripped_returns_empty_string(self):
+        """
+        What it does: Verifies that if all blocks are unknown, returns empty string.
+        Purpose: Ensure we don't return an empty list (which could cause other issues).
+        """
+        content = [
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "tool_reference", "tool_name": "Grep"},
+        ]
+        result = _sanitize_content_blocks(content)
+        assert result == ""
+
+    def test_non_dict_blocks_preserved(self):
+        """
+        What it does: Verifies non-dict items in content list are kept.
+        Purpose: Defensive test for unexpected content formats.
+        """
+        content = [{"type": "text", "text": "hello"}, "raw string"]
+        result = _sanitize_content_blocks(content)
+        assert len(result) == 2
+
+    def test_original_content_not_mutated(self):
+        """
+        What it does: Verifies the original content list is not mutated.
+        Purpose: Ensure sanitization creates new objects, not modifying input.
+        """
+        nested = [{"type": "tool_reference", "tool_name": "Read"}]
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": nested,
+            }
+        ]
+        _sanitize_content_blocks(content)
+        # Original nested list should still have the tool_reference
+        assert len(nested) == 1
+        assert nested[0]["type"] == "tool_reference"
+
+
+class TestAnthropicMessageSanitization:
+    """
+    Integration tests for AnthropicMessage model_validator sanitization.
+
+    These test the full Pydantic validation flow with unknown content types.
+    """
+
+    def test_tool_reference_in_content_does_not_cause_422(self):
+        """
+        What it does: Verifies the exact error scenario from the bug report.
+        Purpose: PRIMARY regression test — this was the 422 error.
+        """
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tooluse_BRzw6tnDuahXyE0YtDfHWT",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": "Read"},
+                        {"type": "tool_reference", "tool_name": "Grep"},
+                        {"type": "tool_reference", "tool_name": "Agent"},
+                    ],
+                },
+                {
+                    "type": "text",
+                    "text": "Some user message",
+                },
+            ],
+        )
+        assert message.role == "user"
+        assert len(message.content) == 2
+        assert message.content[0].type == "tool_result"
+        assert message.content[1].type == "text"
+
+    def test_tool_reference_with_cache_control(self):
+        """
+        What it does: Verifies tool_result with cache_control and tool_reference works.
+        Purpose: Test the exact payload format from the bug report (includes cache_control).
+        """
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tooluse_HFXNsdZNnsjs94KZGoZmQJ",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": "Agent"},
+                        {"type": "tool_reference", "tool_name": "Read"},
+                        {"type": "tool_reference", "tool_name": "Grep"},
+                        {"type": "tool_reference", "tool_name": "Glob"},
+                    ],
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        )
+        assert len(message.content) == 1
+        assert message.content[0].type == "tool_result"
+
+    def test_normal_content_not_affected(self):
+        """
+        What it does: Verifies normal messages are not affected by sanitizer.
+        Purpose: Ensure no regressions for standard content.
+        """
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "Hello"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": "tool output",
+                },
+            ],
+        )
+        assert len(message.content) == 2
+        assert message.content[0].text == "Hello"
+        assert message.content[1].content == "tool output"
+
+    def test_string_content_not_affected(self):
+        """
+        What it does: Verifies string content messages are not affected.
+        Purpose: Ensure simple string messages still work.
+        """
+        message = AnthropicMessage(role="user", content="Just a string")
+        assert message.content == "Just a string"
+
+    def test_assistant_message_with_unknown_type_sanitized(self):
+        """
+        What it does: Verifies sanitization works for assistant messages too.
+        Purpose: Ensure both roles are covered.
+        """
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "text", "text": "Here's my response"},
+                {"type": "some_unknown_type", "data": "metadata"},
+            ],
+        )
+        assert len(message.content) == 1
+        assert message.content[0].text == "Here's my response"
+
+    def test_full_request_with_tool_reference_validates(self):
+        """
+        What it does: Verifies full AnthropicMessagesRequest with tool_reference validates.
+        Purpose: End-to-end test simulating the actual failing request.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content="Hello",
+                ),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {"type": "text", "text": "Let me check..."},
+                        {"type": "tool_use", "id": "tooluse_abc", "name": "Read", "input": {"path": "file.py"}},
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tooluse_abc",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "Read"},
+                                {"type": "tool_reference", "tool_name": "Grep"},
+                            ],
+                        },
+                        {"type": "text", "text": "How do I fix this?"},
+                    ],
+                ),
+            ],
+        )
+        assert len(request.messages) == 3
+        assert request.model == "claude-opus-4-6"
