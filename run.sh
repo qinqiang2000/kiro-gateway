@@ -51,9 +51,11 @@ cmd_start() {
     fi
     mkdir -p "$LOG_DIR"
     rotate_log
+    set -m  # enable job control so & creates a new process group
     nohup "$PYTHON" "$PROJECT_DIR/main.py" "$@" > "$LOG_FILE" 2>&1 < /dev/null &
     local pid=$!
     disown
+    set +m
     echo "$pid" > "$PID_FILE"
     echo "Kiro Gateway started (PID: $pid)"
     echo "Log: $LOG_FILE"
@@ -68,7 +70,7 @@ cmd_stop() {
     if ! is_running; then
         echo "Kiro Gateway is not running"
         [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
-        exit 0
+        return 0
     fi
     local PID
     PID=$(cat "$PID_FILE")
