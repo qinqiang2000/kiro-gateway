@@ -80,7 +80,7 @@
 
 ```bash
 # リポジトリをクローン（Git が必要）
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 
 # または ZIP をダウンロード：Code → Download ZIP → 解凍 → kiro-gateway フォルダを開く
@@ -264,7 +264,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 ```bash
 # 1. クローンと設定
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 cp .env.example .env
 # .env を認証情報で編集
@@ -277,57 +277,6 @@ docker-compose logs -f
 curl http://localhost:8000/health
 ```
 
-### Docker Run (Compose なし)
-
-<details>
-<summary>🔹 環境変数を使用</summary>
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  -e REFRESH_TOKEN="your_refresh_token" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 認証情報ファイルを使用</summary>
-
-**Linux/macOS:**
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-**Windows (PowerShell):**
-```powershell
-docker run -d `
-  -p 8000:8000 `
-  -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
-  -e PROXY_API_KEY="my-super-secret-password-123" `
-  --name kiro-gateway `
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 .env ファイルを使用</summary>
-
-```bash
-docker run -d -p 8000:8000 --env-file .env --name kiro-gateway ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
 
 ### Docker Compose 設定
 
