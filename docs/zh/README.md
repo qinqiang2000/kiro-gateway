@@ -317,6 +317,63 @@ docker run -d -p 8000:8000 --env-file .env kiro-gateway
 
 ---
 
+## 🖥️ 桌面 GUI
+
+原生桌面应用，内置网关服务器和可视化仪表盘。无需终端 — 双击即可运行。
+
+### 下载
+
+预编译包在 [Releases](https://github.com/qinqiang2000/kiro-gateway/releases) 页面：
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| **Windows** | `KiroGateway-windows.zip` | 需要 Windows 10+。**必须先解压再运行** |
+| **macOS** | `KiroGateway-macos.zip` | 需要 macOS 10.15+。解压后将 `Kiro Gateway.app` 移到应用程序文件夹 |
+
+> ⚠️ **Windows 用户：** 不要在 zip 里直接双击 exe。必须先完整解压 — exe 依赖旁边的 `_internal/` 文件夹。
+
+### 从源码运行
+
+```bash
+# 安装额外依赖
+pip install pywebview
+
+# 启动 GUI 窗口
+python gui.py
+
+# 指定端口
+python gui.py --port 9000
+
+# 仅服务器模式（无 GUI 窗口）
+python gui.py --no-gui
+```
+
+### 功能说明
+
+- 自动检测 Kiro 凭据（Kiro IDE、kiro-cli）
+- 在 `127.0.0.1:8000` 启动网关服务器
+- 打开原生桌面窗口显示仪表盘 UI
+- 自动注入 Claude CLI 配置，使其通过网关路由
+- 退出时恢复原始 Claude CLI 配置
+
+### Claude CLI 集成
+
+GUI 启动时会自动配置 `~/.claude/settings.json`，将 Claude CLI 指向网关。这意味着 Claude Code 会通过网关使用 Kiro 模型，无需手动配置。
+
+**前提条件：** Claude CLI 必须已安装并至少运行过一次（确保 `~/.claude/settings.json` 存在）。
+
+### 从源码构建
+
+```bash
+pip install pyinstaller pywebview
+# Windows 还需要：pip install pythonnet
+
+pyinstaller build.spec --noconfirm
+# 输出：dist/KiroGateway/（Windows）或 dist/Kiro Gateway.app（macOS）
+```
+
+---
+
 ## 🌐 VPN/代理支持
 
 **适用于中国、企业网络或与 AWS 服务连接存在问题的地区的用户。**
