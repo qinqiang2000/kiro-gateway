@@ -28,7 +28,8 @@ Reference: https://docs.anthropic.com/en/api/messages
 
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field
+from loguru import logger
+from pydantic import BaseModel, Field, model_validator
 
 
 # ==================================================================================================
@@ -174,6 +175,87 @@ ContentBlock = Union[
     GenericContentBlock,
 ]
 
+# Known content block types that we can parse
+KNOWN_CONTENT_TYPES = {"text", "thinking", "image", "tool_use", "tool_result"}
+
+# Known content types inside tool_result.content
+KNOWN_TOOL_RESULT_CONTENT_TYPES = {"text", "image"}
+
+
+def _sanitize_tool_result_content(content: Any) -> Any:
+    """
+    Sanitize the content field inside a tool_result block.
+
+    Removes unknown content types (e.g., tool_reference) from the nested
+    content list. These are client-side metadata that the conversion
+    pipeline would ignore anyway.
+
+    Args:
+        content: The content field of a tool_result block (str, list, or None)
+
+    Returns:
+        Sanitized content with unknown types removed
+    """
+    if not isinstance(content, list):
+        return content
+
+    sanitized = []
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            if item_type in KNOWN_TOOL_RESULT_CONTENT_TYPES:
+                sanitized.append(item)
+            else:
+                logger.debug(
+                    f"Stripped unknown type '{item_type}' from tool_result.content"
+                )
+        else:
+            sanitized.append(item)
+
+    return sanitized if sanitized else ""
+
+
+def _sanitize_content_blocks(content: Any) -> Any:
+    """
+    Sanitize message content by removing unknown content block types.
+
+    Some clients (e.g., Claude Code) send non-standard content types like
+    'tool_reference' that are not part of the Anthropic API spec. These blocks
+    carry client-side metadata and would be ignored by the conversion pipeline,
+    but they cause Pydantic validation failures (422) before reaching conversion.
+
+    This function strips unknown types so the request can pass validation,
+    matching the behavior the conversion pipeline would have anyway.
+
+    Args:
+        content: Raw message content (str, list of dicts, or other)
+
+    Returns:
+        Sanitized content with unknown block types removed
+    """
+    if not isinstance(content, list):
+        return content
+
+    sanitized = []
+    for block in content:
+        if not isinstance(block, dict):
+            sanitized.append(block)
+            continue
+
+        block_type = block.get("type", "")
+
+        if block_type in KNOWN_CONTENT_TYPES:
+            # For tool_result blocks, also sanitize nested content
+            if block_type == "tool_result" and "content" in block:
+                block = {**block, "content": _sanitize_tool_result_content(block["content"])}
+            sanitized.append(block)
+        else:
+            logger.debug(
+                f"Stripped unknown content block type '{block_type}' from message"
+            )
+
+    return sanitized if sanitized else ""
+
 
 # ==================================================================================================
 # Message Models
@@ -193,6 +275,29 @@ class AnthropicMessage(BaseModel):
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unknown_content_types(cls, data: Any) -> Any:
+        """
+        Pre-validation sanitizer that removes unknown content block types.
+
+        Clients like Claude Code may send non-standard types (e.g., tool_reference)
+        that are not part of the Anthropic API spec. These would be ignored by the
+        conversion pipeline but cause 422 validation errors at the Pydantic layer.
+
+        This validator strips them before validation, matching the conversion
+        pipeline's existing behavior of ignoring unknown types.
+
+        Args:
+            data: Raw input data before Pydantic validation
+
+        Returns:
+            Sanitized data with unknown content types removed
+        """
+        if isinstance(data, dict) and "content" in data:
+            data["content"] = _sanitize_content_blocks(data["content"])
+        return data
 
 
 # ==================================================================================================

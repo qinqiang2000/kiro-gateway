@@ -80,7 +80,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
 ```bash
 # Clona el repositorio (requiere Git)
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 
 # O descarga el ZIP: Code → Download ZIP → extrae → abre la carpeta kiro-gateway
@@ -264,7 +264,7 @@ Si necesitas extraer manualmente el refresh token (por ejemplo, para depuración
 
 ```bash
 # 1. Clona y configura
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 cp .env.example .env
 # Edita .env con tus credenciales
@@ -277,57 +277,6 @@ docker-compose logs -f
 curl http://localhost:8000/health
 ```
 
-### Docker Run (Sin Compose)
-
-<details>
-<summary>🔹 Usando Variables de Entorno</summary>
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  -e REFRESH_TOKEN="your_refresh_token" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 Usando Archivo de Credenciales</summary>
-
-**Linux/macOS:**
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-**Windows (PowerShell):**
-```powershell
-docker run -d `
-  -p 8000:8000 `
-  -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
-  -e PROXY_API_KEY="my-super-secret-password-123" `
-  --name kiro-gateway `
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 Usando Archivo .env</summary>
-
-```bash
-docker run -d -p 8000:8000 --env-file .env --name kiro-gateway ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
 
 ### Configuración de Docker Compose
 

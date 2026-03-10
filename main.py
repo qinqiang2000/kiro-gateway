@@ -632,7 +632,7 @@ def print_startup_banner(host: str, port: int) -> None:
     print()
     print(f"  {DIM}{'─' * 48}{RESET}")
     print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
+    print(f"  {YELLOW}➜  https://github.com/qinqiang2000/kiro-gateway/issues{RESET}")
     print(f"  {DIM}{'─' * 48}{RESET}")
     print()
 

@@ -80,7 +80,7 @@
 
 ```bash
 # 克隆仓库（需要 Git）
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 
 # 或下载 ZIP：Code → Download ZIP → 解压 → 打开 kiro-gateway 文件夹
@@ -264,7 +264,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 ```bash
 # 1. 克隆并配置
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 cp .env.example .env
 # 使用您的凭据编辑 .env
@@ -277,57 +277,6 @@ docker-compose logs -f
 curl http://localhost:8000/health
 ```
 
-### Docker Run（不使用 Compose）
-
-<details>
-<summary>🔹 使用环境变量</summary>
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  -e REFRESH_TOKEN="your_refresh_token" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 使用凭据文件</summary>
-
-**Linux/macOS:**
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-**Windows (PowerShell):**
-```powershell
-docker run -d `
-  -p 8000:8000 `
-  -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
-  -e PROXY_API_KEY="my-super-secret-password-123" `
-  --name kiro-gateway `
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 使用 .env 文件</summary>
-
-```bash
-docker run -d -p 8000:8000 --env-file .env --name kiro-gateway ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
 
 ### Docker Compose 配置
 

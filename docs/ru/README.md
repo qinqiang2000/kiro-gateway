@@ -80,7 +80,7 @@
 
 ```bash
 # Клонируйте репозиторий (требуется Git)
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 
 # Или скачайте ZIP: Code → Download ZIP → распакуйте → откройте папку kiro-gateway
@@ -264,7 +264,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 ```bash
 # 1. Клонируйте и настройте
-git clone https://github.com/Jwadow/kiro-gateway.git
+git clone https://github.com/qinqiang2000/kiro-gateway.git
 cd kiro-gateway
 cp .env.example .env
 # Отредактируйте .env с вашими учётными данными
@@ -277,57 +277,6 @@ docker-compose logs -f
 curl http://localhost:8000/health
 ```
 
-### Docker Run (без Compose)
-
-<details>
-<summary>🔹 Использование переменных окружения</summary>
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  -e REFRESH_TOKEN="your_refresh_token" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 Использование файла с учётными данными</summary>
-
-**Linux/macOS:**
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
-  -e PROXY_API_KEY="my-super-secret-password-123" \
-  --name kiro-gateway \
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-**Windows (PowerShell):**
-```powershell
-docker run -d `
-  -p 8000:8000 `
-  -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
-  -e PROXY_API_KEY="my-super-secret-password-123" `
-  --name kiro-gateway `
-  ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
-
-<details>
-<summary>🔹 Использование файла .env</summary>
-
-```bash
-docker run -d -p 8000:8000 --env-file .env --name kiro-gateway ghcr.io/jwadow/kiro-gateway:latest
-```
-
-</details>
 
 ### Конфигурация Docker Compose
 
