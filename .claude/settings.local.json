@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew tap:*)",
+      "Bash(HOMEBREW_NO_AUTO_UPDATE=1 brew tap:*)",
+      "Bash(brew autoupdate:*)",
+      "Bash(sed:*)",
+      "Bash(claude mcp:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); keys=[k for k in d.get\\(''mcpServers'',{}\\)]; keys.extend\\([k for p in d.get\\(''projects'',{}\\).values\\(\\) if isinstance\\(p,dict\\) for k in p.get\\(''mcpServers'',{}\\)]\\); print\\(''\\\\n''.join\\(set\\(keys\\)\\)\\)\")",
+      "Bash(curl:*)",
+      "WebFetch(domain:app.apifox.com)",
+      "Bash(for dir in controller service async config dto model)",
+      "Bash(do echo \"=== $dir ===\")",
+      "Read(//Users/chenhuanwei/workspace/kiro-gateway/*/$dir/**)",
+      "Bash(done)"
+    ]
+  }
+}

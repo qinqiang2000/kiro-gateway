@@ -80,6 +80,7 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_ui import router as ui_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -464,6 +465,21 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Web UI management dashboard
+app.include_router(ui_router)
+
+# Serve dashboard HTML at /ui
+from fastapi.responses import FileResponse
+
+@app.get("/ui", response_class=FileResponse)
+async def serve_ui():
+    """Serve the management dashboard."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).parent
+    return FileResponse(base / "web" / "index.html")
 
 
 # --- Uvicorn log config ---

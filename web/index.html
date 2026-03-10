@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kiro Gateway</title>
+<style>
+:root {
+  --bg-deep: #0a0e14;
+  --bg-panel: #111820;
+  --bg-card: #161d27;
+  --bg-hover: #1c2530;
+  --border: #1e2a38;
+  --border-active: #2a3a4e;
+  --text-primary: #c8d6e5;
+  --text-secondary: #6b7d8e;
+  --text-muted: #3d4f5f;
+  --accent: #00d4aa;
+  --accent-dim: rgba(0, 212, 170, 0.15);
+  --accent-glow: rgba(0, 212, 170, 0.3);
+  --red: #ff4757;
+  --red-dim: rgba(255, 71, 87, 0.15);
+  --amber: #ffa502;
+  --amber-dim: rgba(255, 165, 2, 0.15);
+  --blue: #3498db;
+  --mono: 'Menlo', 'Consolas', 'Courier New', monospace;
+  --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Subtle grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0,212,170,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,170,0.02) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app { position: relative; z-index: 1; }
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  -webkit-app-region: drag;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent), #00a884);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--bg-deep);
+  font-family: var(--mono);
+}
+
+.header-title {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.header-version {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+/* Status indicator */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.status-dot.offline {
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(255,71,87,0.3);
+  animation: none;
+}
+
+.status-dot.warning {
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(255,165,2,0.3);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.status-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* Main layout */
+.main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto 1fr;
+  gap: 1px;
+  background: var(--border);
+  min-height: calc(100vh - 57px);
+}
+
+/* Card base */
+.card {
+  background: var(--bg-panel);
+  padding: 20px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.card-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Status card */
+.status-card { grid-column: 1 / -1; }
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.stat-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  transition: border-color 0.2s;
+}
+
+.stat-item:hover { border-color: var(--border-active); }
+
+.stat-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.stat-value.ok { color: var(--accent); }
+.stat-value.warn { color: var(--amber); }
+.stat-value.err { color: var(--red); }
+
+.stat-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* Credentials card */
+.cred-list { display: flex; flex-direction: column; gap: 8px; }
+
+.cred-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 16px;
+  transition: border-color 0.2s;
+}
+
+.cred-item:hover { border-color: var(--border-active); }
+
+.cred-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.cred-icon.cli {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.cred-icon.ide {
+  background: rgba(52,152,219,0.15);
+  color: var(--blue);
+}
+
+.cred-icon.env {
+  background: var(--amber-dim);
+  color: var(--amber);
+}
+
+.cred-info { flex: 1; min-width: 0; }
+
+.cred-source {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.cred-path {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cred-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.cred-badge.valid {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.cred-badge.expired {
+  background: var(--red-dim);
+  color: var(--red);
+}
+
+.cred-empty {
+  text-align: center;
+  padding: 32px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.cred-empty-hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-top: 8px;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* Models card */
+.model-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.model-tag {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  transition: all 0.2s;
+}
+
+.model-tag:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Control card */
+.control-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.btn {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 10px 20px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+.btn:hover {
+  border-color: var(--border-active);
+  background: var(--bg-hover);
+}
+
+.btn:active { transform: scale(0.98); }
+
+.btn-accent {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.btn-accent:hover {
+  background: rgba(0, 212, 170, 0.25);
+  border-color: var(--accent);
+}
+
+.btn-danger {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+.btn-danger:hover {
+  background: rgba(255, 71, 87, 0.25);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-icon { font-size: 14px; }
+
+/* Log viewer */
+.log-card { grid-column: 1 / -1; }
+
+.log-container {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px;
+  scroll-behavior: smooth;
+}
+
+.log-container::-webkit-scrollbar { width: 6px; }
+.log-container::-webkit-scrollbar-track { background: transparent; }
+.log-container::-webkit-scrollbar-thumb {
+  background: var(--border-active);
+  border-radius: 3px;
+}
+
+.log-line {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line.error { color: var(--red); }
+.log-line.warning { color: var(--amber); }
+.log-line.info-highlight { color: var(--accent); }
+
+.log-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.log-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.log-toolbar .btn {
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.log-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Loading skeleton */
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 4px;
+  height: 16px;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Toast */
+.toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  animation: slideIn 0.2s ease-out;
+  max-width: 360px;
+}
+
+.toast.success { border-color: var(--accent); }
+.toast.error { border-color: var(--red); }
+
+@keyframes slideIn {
+  from { transform: translateX(20px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+  .main {
+    grid-template-columns: 1fr;
+  }
+  .status-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">K</div>
+      <span class="header-title">Kiro Gateway</span>
+      <span class="header-version" id="version">v--</span>
+    </div>
+    <div class="header-right">
+      <div class="status-dot" id="statusDot"></div>
+      <span class="status-text" id="statusText">连接中...</span>
+    </div>
+  </div>
+
+  <!-- Main Grid -->
+  <div class="main">
+    <!-- Status Overview -->
+    <div class="card status-card">
+      <div class="card-header">
+        <span class="card-label">状态总览</span>
+        <span class="card-label" id="lastUpdate">--</span>
+      </div>
+      <div class="status-grid" id="statusGrid">
+        <div class="stat-item">
+          <div class="stat-label">认证方式</div>
+          <div class="stat-value" id="authType">--</div>
+          <div class="stat-sub" id="authRegion">--</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">Token 状态</div>
+          <div class="stat-value" id="tokenStatus">--</div>
+          <div class="stat-sub" id="tokenExpiry">--</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">可用模型</div>
+          <div class="stat-value" id="modelCount">--</div>
+          <div class="stat-sub" id="modelSub">--</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">运行环境</div>
+          <div class="stat-value" id="platform">--</div>
+          <div class="stat-sub" id="pythonVer">--</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Credentials -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">凭证检测</span>
+        <button class="btn" onclick="loadCredentials()" style="padding:4px 10px;font-size:11px;">刷新</button>
+      </div>
+      <div class="cred-list" id="credList">
+        <div class="cred-empty">扫描中...</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">操作</span>
+      </div>
+      <div class="control-card">
+        <button class="btn btn-accent" id="proxyToggleBtn" onclick="toggleProxy()">
+          <span class="btn-icon">▶</span> 开启反代
+        </button>
+        <button class="btn" onclick="checkProxy()">
+          <span class="btn-icon">◎</span> 检测反代
+        </button>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="card log-card">
+      <div class="card-header">
+        <span class="card-label">运行日志</span>
+        <div class="log-toolbar">
+          <span class="log-count" id="logCount">0 行</span>
+          <button class="btn" onclick="clearLogs()">清空</button>
+          <button class="btn" id="autoScrollBtn" onclick="toggleAutoScroll()">自动滚动: 开</button>
+        </div>
+      </div>
+      <div class="log-container" id="logContainer">
+        <div class="log-empty">等待日志...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+const API_BASE = window.location.origin;
+let autoScroll = true;
+let logLines = [];
+let eventSource = null;
+
+// Toast notification
+function toast(msg, type = 'info') {
+  const container = document.getElementById('toastContainer');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 200); }, 3000);
+}
+
+// Load gateway status
+async function loadStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/ui/status`);
+    const data = await res.json();
+
+    document.getElementById('statusDot').className = 'status-dot';
+    document.getElementById('statusText').textContent = '运行中';
+
+    // Auth
+    if (data.auth && !data.auth.error) {
+      const authNames = { kiro_desktop: 'Kiro Desktop', aws_sso_oidc: 'AWS SSO' };
+      document.getElementById('authType').textContent = authNames[data.auth.type] || data.auth.type;
+      document.getElementById('authRegion').textContent = data.auth.region;
+
+      const tokenEl = document.getElementById('tokenStatus');
+      const expiryEl = document.getElementById('tokenExpiry');
+      if (data.auth.token_valid) {
+        tokenEl.textContent = '有效';
+        tokenEl.className = 'stat-value ok';
+        if (data.auth.token_expiring_soon) {
+          tokenEl.textContent = '即将过期';
+          tokenEl.className = 'stat-value warn';
+        }
+      } else {
+        tokenEl.textContent = '已过期';
+        tokenEl.className = 'stat-value err';
+      }
+      if (data.auth.expires_at) {
+        const d = new Date(data.auth.expires_at);
+        expiryEl.textContent = d.toLocaleTimeString('zh-CN');
+      }
+    }
+
+    // Models
+    if (data.models) {
+      document.getElementById('modelCount').textContent = data.models.count;
+      document.getElementById('modelSub').textContent = data.models.list.slice(0, 3).join(', ') + (data.models.count > 3 ? '...' : '');
+    }
+
+    // Platform
+    document.getElementById('platform').textContent = data.platform || '--';
+    document.getElementById('pythonVer').textContent = `Python ${data.python || '--'}`;
+    document.getElementById('version').textContent = 'PID ' + (data.pid || '--');
+
+    // Update time
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('zh-CN');
+
+  } catch (e) {
+    document.getElementById('statusDot').className = 'status-dot offline';
+    document.getElementById('statusText').textContent = '无法连接';
+  }
+}
+
+// Load credentials
+async function loadCredentials() {
+  const list = document.getElementById('credList');
+  try {
+    const res = await fetch(`${API_BASE}/api/ui/credentials`);
+    const data = await res.json();
+
+    if (data.credentials.length === 0) {
+      list.innerHTML = `
+        <div class="cred-empty">
+          未检测到 Kiro 凭证
+          <div class="cred-empty-hint">请先登录 Kiro IDE 或运行 kiro-cli login</div>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = data.credentials.map(c => {
+      const iconClass = c.source === 'kiro-cli' ? 'cli' : c.source === 'kiro-ide' ? 'ide' : 'env';
+      const iconText = c.source === 'kiro-cli' ? '⌘' : c.source === 'kiro-ide' ? '◈' : '$';
+      const sourceName = c.source === 'kiro-cli' ? 'Kiro CLI' : c.source === 'kiro-ide' ? 'Kiro IDE' : '.env';
+      const hasToken = c.has_refresh_token;
+      const badgeClass = hasToken ? 'valid' : 'expired';
+      const badgeText = hasToken ? 'refresh_token ✓' : '无 token';
+
+      return `
+        <div class="cred-item">
+          <div class="cred-icon ${iconClass}">${iconText}</div>
+          <div class="cred-info">
+            <div class="cred-source">${sourceName}${c.auth_type ? ' · ' + c.auth_type : ''}${c.key ? ' · ' + c.key.split(':')[1] : ''}</div>
+            <div class="cred-path">${c.path}</div>
+          </div>
+          <span class="cred-badge ${badgeClass}">${badgeText}</span>
+        </div>`;
+    }).join('');
+
+  } catch (e) {
+    list.innerHTML = '<div class="cred-empty">检测失败</div>';
+  }
+}
+
+// Proxy toggle
+let proxyEnabled = false;
+
+async function loadProxyStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/ui/proxy/status`);
+    const data = await res.json();
+    proxyEnabled = data.enabled;
+    updateProxyBtn();
+  } catch {}
+}
+
+function updateProxyBtn() {
+  const btn = document.getElementById('proxyToggleBtn');
+  if (proxyEnabled) {
+    btn.innerHTML = '<span class="btn-icon">■</span> 关闭反代';
+    btn.className = 'btn btn-danger';
+  } else {
+    btn.innerHTML = '<span class="btn-icon">▶</span> 开启反代';
+    btn.className = 'btn btn-accent';
+  }
+}
+
+async function toggleProxy() {
+  const endpoint = proxyEnabled ? '/api/ui/proxy/disable' : '/api/ui/proxy/enable';
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      proxyEnabled = data.enabled;
+      updateProxyBtn();
+      toast(proxyEnabled ? '反代已开启，Claude CLI 已配置' : '反代已关闭，Claude CLI 已恢复', 'success');
+    } else {
+      toast('操作失败: ' + data.error, 'error');
+    }
+  } catch (e) {
+    toast('请求失败', 'error');
+  }
+}
+
+async function checkProxy() {
+  try {
+    const res = await fetch(`${API_BASE}/api/ui/proxy/check`);
+    const data = await res.json();
+    if (data.ok) {
+      toast(`反代已生效，Claude CLI → ${data.base_url}`, 'success');
+    } else {
+      toast(`反代未生效：${data.error || 'BASE_URL=' + data.base_url}`, 'error');
+    }
+  } catch (e) {
+    toast('检测失败', 'error');
+  }
+}
+
+// Log viewer
+function appendLog(line) {
+  logLines.push(line);
+  if (logLines.length > 2000) logLines = logLines.slice(-1500);
+
+  const container = document.getElementById('logContainer');
+  // Remove empty state
+  const empty = container.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  const el = document.createElement('div');
+  el.className = 'log-line';
+  if (line.includes('ERROR') || line.includes('error')) el.className += ' error';
+  else if (line.includes('WARNING') || line.includes('warn')) el.className += ' warning';
+  else if (line.includes('Starting') || line.includes('ready') || line.includes('refreshed')) el.className += ' info-highlight';
+  el.textContent = line;
+  container.appendChild(el);
+
+  // Trim DOM nodes
+  while (container.children.length > 1500) {
+    container.removeChild(container.firstChild);
+  }
+
+  if (autoScroll) container.scrollTop = container.scrollHeight;
+  document.getElementById('logCount').textContent = `${logLines.length} 行`;
+}
+
+function clearLogs() {
+  logLines = [];
+  const container = document.getElementById('logContainer');
+  container.innerHTML = '<div class="log-empty">日志已清空</div>';
+  document.getElementById('logCount').textContent = '0 行';
+}
+
+function toggleAutoScroll() {
+  autoScroll = !autoScroll;
+  document.getElementById('autoScrollBtn').textContent = `自动滚动: ${autoScroll ? '开' : '关'}`;
+}
+
+// SSE log streaming
+function connectLogStream() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(`${API_BASE}/api/ui/logs/stream`);
+  eventSource.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'log' && data.line) appendLog(data.line);
+    } catch {}
+  };
+  eventSource.onerror = () => {
+    setTimeout(connectLogStream, 5000);
+  };
+}
+
+// Init
+loadStatus();
+loadCredentials();
+loadProxyStatus();
+connectLogStream();
+setInterval(loadStatus, 30000);
+</script>
+</body>
+</html>

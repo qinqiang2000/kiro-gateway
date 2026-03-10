@@ -1,0 +1,100 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pywebview pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec --noconfirm
+
+      - name: Compress artifact
+        run: Compress-Archive -Path "dist\KiroGateway" -DestinationPath "dist\KiroGateway-windows.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KiroGateway-windows
+          path: dist/KiroGateway-windows.zip
+
+  build-macos:
+    name: Build macOS App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pywebview pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec --noconfirm
+
+      - name: Fix Python framework symlink
+        run: |
+          APP="dist/Kiro Gateway.app"
+          FRAMEWORKS="$APP/Contents/Frameworks"
+          if [ -d "$FRAMEWORKS/Python.framework" ] && [ ! -f "$FRAMEWORKS/Python" ]; then
+            PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+            ln -sf "Python.framework/Versions/$PY_VER/Python" "$FRAMEWORKS/Python"
+          fi
+
+      - name: Compress artifact
+        run: cd dist && zip -r "KiroGateway-macos.zip" "Kiro Gateway.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KiroGateway-macos
+          path: dist/KiroGateway-macos.zip
+
+  release:
+    name: Create Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            KiroGateway-windows/KiroGateway-windows.zip
+            KiroGateway-macos/KiroGateway-macos.zip
+          generate_release_notes: true

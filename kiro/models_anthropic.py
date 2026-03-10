@@ -78,6 +78,19 @@ class ToolUseContentBlock(BaseModel):
     input: Dict[str, Any]
 
 
+class GenericContentBlock(BaseModel):
+    """
+    Fallback content block for unknown/unsupported types.
+
+    Catches content block types not explicitly modeled (e.g. tool_reference,
+    server_tool_use) so Pydantic validation doesn't reject the entire request.
+    The converter layer handles extracting useful data from these blocks.
+    """
+
+    type: str
+    model_config = {"extra": "allow"}
+
+
 class ToolResultContentBlock(BaseModel):
     """
     Tool result content block in Anthropic format.
@@ -89,7 +102,10 @@ class ToolResultContentBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock"]]]
+        Union[
+            str,
+            List[Union["TextContentBlock", "ImageContentBlock", GenericContentBlock]],
+        ]
     ] = None
     is_error: Optional[bool] = None
 
@@ -147,12 +163,15 @@ class ImageContentBlock(BaseModel):
 
 
 # Union type for all content blocks (including images and thinking)
+# GenericContentBlock MUST be last — Pydantic tries unions in order,
+# and we want specific types to match first.
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
+    GenericContentBlock,
 ]
 
 
