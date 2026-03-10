@@ -78,6 +78,17 @@ a = Analysis(
         'dotenv',
         # pywebview backends
         'webview',
+        'webview.platforms',
+        'webview.platforms.winforms',
+        'webview.platforms.edgechromium',
+        'webview.platforms.cef',
+        'webview.platforms.cocoa',
+        'clr',
+        'pythonnet',
+        'System',
+        'System.Windows.Forms',
+        'System.Drawing',
+        'System.Threading',
         # SQLite (for credential reading)
         'sqlite3',
         # Email (used by some deps)
