@@ -316,6 +316,63 @@ docker run -d -p 8000:8000 --env-file .env kiro-gateway
 
 ---
 
+## 🖥️ Desktop GUI
+
+A native desktop app that bundles the gateway server with a GUI dashboard. No terminal needed — just double-click to run.
+
+### Download
+
+Pre-built binaries are available on the [Releases](https://github.com/qinqiang2000/kiro-gateway/releases) page:
+
+| Platform | File | Notes |
+|----------|------|-------|
+| **Windows** | `KiroGateway-windows.zip` | Requires Windows 10+. **Must extract the full zip before running** |
+| **macOS** | `KiroGateway-macos.zip` | Requires macOS 10.15+. Extract and move `Kiro Gateway.app` to Applications |
+
+> ⚠️ **Windows users:** Do NOT double-click the exe inside the zip. You must extract the entire zip first — the exe depends on the `_internal/` folder next to it.
+
+### Run from Source
+
+```bash
+# Install additional dependency
+pip install pywebview
+
+# Launch GUI window
+python gui.py
+
+# Or specify a port
+python gui.py --port 9000
+
+# Server-only mode (no GUI window)
+python gui.py --no-gui
+```
+
+### What the GUI Does
+
+- Auto-detects Kiro credentials (Kiro IDE, kiro-cli)
+- Starts the gateway server on `127.0.0.1:8000`
+- Opens a native desktop window with the dashboard UI
+- Automatically injects Claude CLI settings to route through the gateway
+- Restores original Claude CLI settings on exit
+
+### Claude CLI Integration
+
+When the GUI starts, it automatically configures `~/.claude/settings.json` to point Claude CLI at the gateway. This means Claude Code will use Kiro models through the gateway without manual configuration.
+
+**Prerequisite:** Claude CLI must be installed and run at least once (so `~/.claude/settings.json` exists).
+
+### Build from Source
+
+```bash
+pip install pyinstaller pywebview
+# On Windows, also: pip install pythonnet
+
+pyinstaller build.spec --noconfirm
+# Output: dist/KiroGateway/ (Windows) or dist/Kiro Gateway.app (macOS)
+```
+
+---
+
 ## 🌐 VPN/Proxy Support
 
 **For users in China, corporate networks, or regions with connectivity issues to AWS services.**
