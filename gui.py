@@ -18,6 +18,13 @@ import threading
 import time
 from pathlib import Path
 
+# When running as Windows GUI app (console=False), stdout/stderr are None.
+# Any print() call would crash. Redirect to devnull.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 # PyInstaller sets sys._MEIPASS to the temp extraction directory
 # In dev mode, use the script's parent directory
 if getattr(sys, 'frozen', False):
