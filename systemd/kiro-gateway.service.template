@@ -1,0 +1,16 @@
+[Unit]
+Description=Kiro Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/path/to/kiro-gateway
+ExecStart=/usr/bin/python3 /path/to/kiro-gateway/main.py --port 8001
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/path/to/kiro-gateway/log/gateway.log
+StandardError=append:/path/to/kiro-gateway/log/gateway.log
+
+[Install]
+WantedBy=multi-user.target

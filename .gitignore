@@ -33,3 +33,6 @@ htmlcov/
 # Runtime
 log/
 .venv/
+
+# Systemd (generated from template, not committed)
+systemd/kiro-gateway.service
