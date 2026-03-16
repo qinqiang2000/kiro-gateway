@@ -93,6 +93,14 @@ logger.add(
     colorize=True,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 )
+logger.add(
+    "/tmp/kiro-gateway.log",
+    level=LOG_LEVEL,
+    rotation="10 MB",
+    retention=1,
+    colorize=False,
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+)
 
 
 class InterceptHandler(logging.Handler):
