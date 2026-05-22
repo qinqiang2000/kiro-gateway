@@ -495,12 +495,29 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
 # kiro-auth-token.json.  The gateway reloads this file on the configured interval
 # so it always has a fresh refresh_token without requiring a restart.
 # Default: 1800 seconds (30 minutes). Clamped to >= 60s to avoid tight loops
-# from typos like CRED_RELOAD_INTERVAL=0.
+# from typos like CRED_RELOAD_INTERVAL=0. Non-numeric values fall back to the
+# default with a warning rather than crashing the gateway at import time.
 _CRED_RELOAD_MIN: int = 60
-CRED_RELOAD_INTERVAL: int = max(
-    _CRED_RELOAD_MIN,
-    int(os.getenv("CRED_RELOAD_INTERVAL", "1800")),
-)
+_CRED_RELOAD_DEFAULT: int = 1800
+
+
+def _parse_cred_reload_interval() -> int:
+    raw = os.getenv("CRED_RELOAD_INTERVAL")
+    if raw is None or raw == "":
+        return _CRED_RELOAD_DEFAULT
+    try:
+        return max(_CRED_RELOAD_MIN, int(raw))
+    except ValueError:
+        import sys
+        print(
+            f"WARNING: invalid CRED_RELOAD_INTERVAL={raw!r}, "
+            f"falling back to {_CRED_RELOAD_DEFAULT}s",
+            file=sys.stderr,
+        )
+        return _CRED_RELOAD_DEFAULT
+
+
+CRED_RELOAD_INTERVAL: int = _parse_cred_reload_interval()
 
 
 # ==================================================================================================

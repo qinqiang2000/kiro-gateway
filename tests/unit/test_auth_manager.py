@@ -7,6 +7,7 @@ Tests token management logic for Kiro without real network requests.
 
 import asyncio
 import json
+import sqlite3
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, Mock, patch
@@ -3220,3 +3221,285 @@ class TestKiroAuthManagerCredsFileGracefulDegradation:
             token = await manager.get_access_token()
 
         assert token == "still_valid_at"
+
+
+# =============================================================================
+# Tests for explicit profile_arn override on SQLite mode and refresh paths
+# =============================================================================
+
+class TestKiroAuthManagerExplicitProfileArnRespected:
+    """profile_arn_explicit must hold in SQLite loader, network-refresh
+    response, and credential-save paths - not just the JSON file loader.
+    """
+
+    def test_sqlite_loader_respects_profile_arn_explicit(self, tmp_path):
+        """SQLite mode must not silently overwrite an explicit profile_arn,
+        matching the creds_file mode behavior.
+        """
+        db_file = tmp_path / "data.sqlite3"
+        conn = sqlite3.connect(str(db_file))
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        token_data = {
+            "access_token": "at",
+            "refresh_token": "rt",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:111:profile/from-sqlite",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+        }
+        cursor.execute(
+            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+            ("kirocli:social:token", json.dumps(token_data)),
+        )
+        conn.commit()
+        conn.close()
+
+        manager = KiroAuthManager(
+            profile_arn="arn:aws:codewhisperer:us-east-1:222:profile/explicit",
+            sqlite_db=str(db_file),
+            profile_arn_explicit=True,
+        )
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:222:profile/explicit"
+
+    def test_sqlite_loader_still_overrides_when_not_explicit(self, tmp_path):
+        """Negative control: when profile_arn_explicit is False, SQLite must
+        still populate _profile_arn as before.
+        """
+        db_file = tmp_path / "data.sqlite3"
+        conn = sqlite3.connect(str(db_file))
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        cursor.execute(
+            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+            (
+                "kirocli:social:token",
+                json.dumps({
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "profile_arn": "arn:aws:codewhisperer:us-east-1:111:profile/from-sqlite",
+                }),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        manager = KiroAuthManager(
+            profile_arn=None,
+            sqlite_db=str(db_file),
+            profile_arn_explicit=False,
+        )
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:111:profile/from-sqlite"
+
+    @pytest.mark.asyncio
+    async def test_kiro_desktop_refresh_response_respects_profile_arn_explicit(self, tmp_path):
+        """A successful Kiro Desktop refresh response must not overwrite
+        an explicit profile_arn, even when the server returns one.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({"refreshToken": "rt"}))
+
+        manager = KiroAuthManager(
+            profile_arn="arn:aws:codewhisperer:us-east-1:222:profile/explicit",
+            creds_file=str(creds_file),
+            profile_arn_explicit=True,
+        )
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:222:profile/explicit"
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json = Mock(return_value={
+            "accessToken": "new_at",
+            "refreshToken": "new_rt",
+            "expiresIn": 3600,
+            "profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/from-server",
+        })
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await manager._refresh_token_kiro_desktop()
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:222:profile/explicit"
+        assert manager._access_token == "new_at"
+
+    def test_save_credentials_to_file_preserves_disk_profile_arn_when_explicit(self, tmp_path):
+        """_save_credentials_to_file must not write the explicit env-var
+        profileArn back to disk, since the file is owned by Kiro IDE.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "old_rt",
+            "accessToken": "old_at",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/owned-by-kiro-ide",
+        }))
+
+        manager = KiroAuthManager(
+            profile_arn="arn:aws:codewhisperer:us-east-1:222:profile/explicit",
+            creds_file=str(creds_file),
+            profile_arn_explicit=True,
+        )
+        manager._access_token = "new_at"
+        manager._refresh_token = "new_rt"
+
+        manager._save_credentials_to_file()
+
+        saved = json.loads(creds_file.read_text())
+        assert saved["profileArn"] == "arn:aws:codewhisperer:us-east-1:111:profile/owned-by-kiro-ide"
+        assert saved["accessToken"] == "new_at"
+        assert saved["refreshToken"] == "new_rt"
+
+    def test_save_credentials_to_file_writes_profile_arn_when_not_explicit(self, tmp_path):
+        """Negative control: when profile_arn was loaded from disk (not
+        explicit), saving the refreshed tokens should still write profileArn.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "old_rt",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/from-disk",
+        }))
+
+        manager = KiroAuthManager(
+            creds_file=str(creds_file),
+            profile_arn_explicit=False,
+        )
+        manager._access_token = "new_at"
+        manager._refresh_token = "new_rt"
+
+        manager._save_credentials_to_file()
+
+        saved = json.loads(creds_file.read_text())
+        assert saved["profileArn"] == "arn:aws:codewhisperer:us-east-1:111:profile/from-disk"
+
+
+# =============================================================================
+# Tests for force_refresh skip-network-when-disk-fresh optimization
+# =============================================================================
+
+class TestKiroAuthManagerForceRefreshSkipsWhenDiskFresh:
+    """force_refresh must NOT consume a freshly-rotated refresh_token from
+    disk when a 403 was caused by a stale in-memory access_token that the
+    on-disk credentials already supersede.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_returns_disk_token_without_network_when_fresh(
+        self, tmp_path
+    ):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        creds_file.write_text(json.dumps({
+            "refreshToken": "disk_rt",
+            "accessToken": "disk_fresh_at",
+            "expiresAt": future,
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        # Simulate the in-memory token being stale (different from disk).
+        manager._access_token = "stale_at"
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(
+                side_effect=AssertionError("network refresh should not be called")
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            token = await manager.force_refresh()
+
+        assert token == "disk_fresh_at"
+        assert manager._refresh_token == "disk_rt"
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_does_network_when_disk_token_same_as_memory(
+        self, tmp_path
+    ):
+        """If the disk has the SAME access_token we already had in memory,
+        the 403 was a real staleness signal - we must still hit the network.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        creds_file.write_text(json.dumps({
+            "refreshToken": "same_rt",
+            "accessToken": "same_at",
+            "expiresAt": future,
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        # In-memory matches disk - so reload does not provide anything new.
+        manager._access_token = "same_at"
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json = Mock(return_value={
+            "accessToken": "minted_at",
+            "refreshToken": "minted_rt",
+            "expiresIn": 3600,
+        })
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            token = await manager.force_refresh()
+
+        assert token == "minted_at"
+
+
+# =============================================================================
+# Tests for CRED_RELOAD_INTERVAL parsing resilience (config.py)
+# =============================================================================
+
+class TestCredReloadIntervalParsing:
+    """CRED_RELOAD_INTERVAL must fall back to the default on non-numeric or
+    empty env-var values, never crash the gateway at import time.
+    """
+
+    def test_invalid_value_falls_back_to_default(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval, _CRED_RELOAD_DEFAULT
+
+        monkeypatch.setenv("CRED_RELOAD_INTERVAL", "30m")
+        assert _parse_cred_reload_interval() == _CRED_RELOAD_DEFAULT
+
+    def test_empty_string_falls_back_to_default(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval, _CRED_RELOAD_DEFAULT
+
+        monkeypatch.setenv("CRED_RELOAD_INTERVAL", "")
+        assert _parse_cred_reload_interval() == _CRED_RELOAD_DEFAULT
+
+    def test_unset_falls_back_to_default(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval, _CRED_RELOAD_DEFAULT
+
+        monkeypatch.delenv("CRED_RELOAD_INTERVAL", raising=False)
+        assert _parse_cred_reload_interval() == _CRED_RELOAD_DEFAULT
+
+    def test_zero_is_clamped_to_minimum(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval, _CRED_RELOAD_MIN
+
+        monkeypatch.setenv("CRED_RELOAD_INTERVAL", "0")
+        assert _parse_cred_reload_interval() == _CRED_RELOAD_MIN
+
+    def test_negative_is_clamped_to_minimum(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval, _CRED_RELOAD_MIN
+
+        monkeypatch.setenv("CRED_RELOAD_INTERVAL", "-1")
+        assert _parse_cred_reload_interval() == _CRED_RELOAD_MIN
+
+    def test_valid_large_value_passed_through(self, monkeypatch):
+        from kiro.config import _parse_cred_reload_interval
+
+        monkeypatch.setenv("CRED_RELOAD_INTERVAL", "3600")
+        assert _parse_cred_reload_interval() == 3600

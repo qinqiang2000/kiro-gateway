@@ -261,8 +261,10 @@ class KiroAuthManager:
                         self._access_token = token_data['access_token']
                     if 'refresh_token' in token_data:
                         self._refresh_token = token_data['refresh_token']
-                    if 'profile_arn' in token_data:
+                    if 'profile_arn' in token_data and not self._profile_arn_explicit:
                         self._profile_arn = token_data['profile_arn']
+                    elif 'profile_arn' in token_data and self._profile_arn_explicit:
+                        logger.debug(f"profile_arn from SQLite ignored - using explicit value: {self._profile_arn}")
                     if 'region' in token_data:
                         # Store SSO region for OIDC token refresh only
                         # IMPORTANT: CodeWhisperer API is only available in us-east-1,
@@ -449,7 +451,10 @@ class KiroAuthManager:
             existing_data['refreshToken'] = self._refresh_token
             if self._expires_at:
                 existing_data['expiresAt'] = self._expires_at.isoformat()
-            if self._profile_arn:
+            # Do not write the env-var profileArn back to disk when it is
+            # user-explicit - the file is owned by Kiro IDE and our explicit
+            # value should only apply in-memory.
+            if self._profile_arn and not self._profile_arn_explicit:
                 existing_data['profileArn'] = self._profile_arn
             
             # Save
@@ -630,7 +635,7 @@ class KiroAuthManager:
         self._access_token = new_access_token
         if new_refresh_token:
             self._refresh_token = new_refresh_token
-        if new_profile_arn:
+        if new_profile_arn and not self._profile_arn_explicit:
             self._profile_arn = new_profile_arn
         
         # Calculate expiration time with buffer (minus 60 seconds)
@@ -852,15 +857,19 @@ class KiroAuthManager:
     async def force_refresh(self) -> str:
         """
         Forces a token refresh.
-        
+
         Used when receiving a 403 error from the API.
         Reloads credentials from disk first so we pick up any token rotation
-        that Kiro IDE may have written since the last load.
-        
+        that Kiro IDE may have written since the last load. If the reload
+        yields a DIFFERENT access_token that is still fresh, returns it
+        without consuming the (possibly Kiro-IDE-owned) refresh_token on a
+        network call.
+
         Returns:
             New access token
         """
         async with self._lock:
+            old_access = self._access_token
             # Reload from disk first - Kiro IDE may have rotated the refresh_token
             if self._sqlite_db:
                 logger.debug("force_refresh: reloading credentials from SQLite")
@@ -868,6 +877,22 @@ class KiroAuthManager:
             elif self._creds_file:
                 logger.debug("force_refresh: reloading credentials from file")
                 self._load_credentials_from_file(self._creds_file)
+
+            # If the disk reload gave us a different access_token that is
+            # still fresh, the caller's 403 was likely caused by a stale
+            # in-memory token that Kiro IDE has already rotated past. Return
+            # the fresh disk token without burning the new refresh_token.
+            if (
+                self._access_token
+                and self._access_token != old_access
+                and not self.is_token_expiring_soon()
+            ):
+                logger.debug(
+                    "force_refresh: disk reload provided a fresh, different "
+                    "access_token, skipping network refresh"
+                )
+                return self._access_token
+
             await self._refresh_token_request()
             return self._access_token
 
