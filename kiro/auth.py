@@ -39,6 +39,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import (
+    DEFAULT_REGION,
     TOKEN_REFRESH_THRESHOLD,
     get_kiro_refresh_url,
     get_kiro_api_host,
@@ -117,15 +118,17 @@ class KiroAuthManager:
         self,
         refresh_token: Optional[str] = None,
         profile_arn: Optional[str] = None,
-        region: str = "us-east-1",
+        region: str = DEFAULT_REGION,
         creds_file: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
+        region_explicit: bool = False,
+        profile_arn_explicit: bool = False,
     ):
         """
         Initializes the authentication manager.
-        
+
         Args:
             refresh_token: Refresh token for obtaining access token
             profile_arn: AWS CodeWhisperer profile ARN
@@ -135,18 +138,25 @@ class KiroAuthManager:
             client_secret: OAuth client secret (for AWS SSO OIDC, optional)
             sqlite_db: Path to kiro-cli SQLite database (optional)
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
+            region_explicit: If True, the credentials file's `region` field
+                             will not override the `region` argument. Set this
+                             when the caller wants to force a specific region
+                             (e.g., user provided KIRO_REGION env var).
+            profile_arn_explicit: If True, the credentials file's `profileArn`
+                                  field will not override the `profile_arn`
+                                  argument. Set this when PROFILE_ARN env var
+                                  is explicitly provided.
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
-        
-        # Track whether region/profile_arn were explicitly provided by caller
-        # (vs. default values). Used to prevent credentials file from overriding them.
-        from kiro.config import DEFAULT_REGION
-        self._region_explicit = (region != DEFAULT_REGION)
-        self._profile_arn_explicit = (profile_arn is not None)
+
+        # Explicit overrides: when set, credentials file values do not
+        # silently override the caller's region / profile_arn.
+        self._region_explicit = region_explicit
+        self._profile_arn_explicit = profile_arn_explicit
         
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
@@ -861,38 +871,41 @@ class KiroAuthManager:
             await self._refresh_token_request()
             return self._access_token
 
-    def reload_credentials(self) -> bool:
+    async def reload_credentials(self) -> bool:
         """
         Reloads credentials from the configured file or SQLite database.
 
         Called periodically by the background task to pick up tokens that
-        Kiro IDE has refreshed on disk.  Only reloads the refresh_token and
-        access_token fields; explicit region / profile_arn overrides are kept.
+        Kiro IDE has refreshed on disk.  Acquires `self._lock` so it does
+        not race with a concurrent network refresh in `get_access_token()`
+        or `force_refresh()`.  Explicit region / profile_arn overrides are
+        preserved by `_load_credentials_from_file()`.
 
         Returns:
-            True if new credentials were loaded, False otherwise.
+            True if refresh_token or access_token changed, False otherwise.
         """
-        old_refresh = self._refresh_token
-        old_access = self._access_token
+        async with self._lock:
+            old_refresh = self._refresh_token
+            old_access = self._access_token
 
-        try:
-            if self._sqlite_db:
-                self._load_credentials_from_sqlite(self._sqlite_db)
-            elif self._creds_file:
-                self._load_credentials_from_file(self._creds_file)
-            else:
+            try:
+                if self._sqlite_db:
+                    self._load_credentials_from_sqlite(self._sqlite_db)
+                elif self._creds_file:
+                    self._load_credentials_from_file(self._creds_file)
+                else:
+                    return False
+            except Exception as e:
+                logger.warning(f"reload_credentials: failed to reload: {e}")
                 return False
-        except Exception as e:
-            logger.warning(f"reload_credentials: failed to reload: {e}")
-            return False
 
-        changed = (
-            self._refresh_token != old_refresh
-            or self._access_token != old_access
-        )
-        if changed:
-            logger.info("reload_credentials: credentials updated from disk")
-        return changed
+            changed = (
+                self._refresh_token != old_refresh
+                or self._access_token != old_access
+            )
+            if changed:
+                logger.info("reload_credentials: credentials updated from disk")
+            return changed
     
     @property
     def profile_arn(self) -> Optional[str]:

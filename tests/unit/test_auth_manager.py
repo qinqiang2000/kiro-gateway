@@ -1989,7 +1989,9 @@ class TestKiroAuthManagerGracefulDegradation:
                 await manager.get_access_token()
             
             print(f"Verification: ValueError raised with helpful message: {exc_info.value}")
-            assert "kiro-cli login" in str(exc_info.value).lower()
+            msg = str(exc_info.value).lower()
+            assert "invalid_grant" in msg
+            assert "kiro" in msg
     
     @pytest.mark.asyncio
     async def test_get_access_token_non_sqlite_mode_propagates_400_error(self):
@@ -2967,3 +2969,254 @@ class TestKiroAuthManagerEnterpriseIDE:
         print("This is verified by other tests in this class and")
         print("TestKiroAuthManagerSsoRegionSeparation class.")
         assert True  # Documentation test
+
+
+# =============================================================================
+# Tests for explicit region / profile_arn overrides (Kiro IDE token rotation fix)
+# =============================================================================
+
+class TestKiroAuthManagerExplicitOverrides:
+    """region_explicit / profile_arn_explicit prevent the credentials file from
+    silently overriding values the caller passed in.
+    """
+
+    def test_credentials_file_region_is_loaded_when_not_explicit(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "accessToken": "at",
+            "region": "eu-west-1",
+        }))
+
+        manager = KiroAuthManager(
+            region="us-east-1",
+            creds_file=str(creds_file),
+            region_explicit=False,
+        )
+
+        assert manager._region == "eu-west-1"
+
+    def test_credentials_file_region_is_ignored_when_explicit(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "accessToken": "at",
+            "region": "eu-west-1",
+        }))
+
+        manager = KiroAuthManager(
+            region="us-east-1",
+            creds_file=str(creds_file),
+            region_explicit=True,
+        )
+
+        assert manager._region == "us-east-1"
+
+    def test_explicit_us_east_1_still_overrides_file(self, tmp_path):
+        """Regression: when user explicitly sets KIRO_REGION=us-east-1, the
+        file's region must not silently overwrite it (even though the value
+        matches DEFAULT_REGION).
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "region": "ap-southeast-1",
+        }))
+
+        manager = KiroAuthManager(
+            region="us-east-1",
+            creds_file=str(creds_file),
+            region_explicit=True,
+        )
+
+        assert manager._region == "us-east-1"
+
+    def test_credentials_file_profile_arn_is_loaded_when_not_explicit(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/from-file",
+        }))
+
+        manager = KiroAuthManager(
+            profile_arn=None,
+            creds_file=str(creds_file),
+            profile_arn_explicit=False,
+        )
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:111:profile/from-file"
+
+    def test_credentials_file_profile_arn_is_ignored_when_explicit(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/from-file",
+        }))
+
+        manager = KiroAuthManager(
+            profile_arn="arn:aws:codewhisperer:us-east-1:222:profile/explicit",
+            creds_file=str(creds_file),
+            profile_arn_explicit=True,
+        )
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:222:profile/explicit"
+
+
+# =============================================================================
+# Tests for reload_credentials() — background disk reload
+# =============================================================================
+
+class TestKiroAuthManagerReloadCredentials:
+    """reload_credentials() picks up tokens Kiro IDE rotated on disk."""
+
+    @pytest.mark.asyncio
+    async def test_reload_returns_true_when_refresh_token_changed_on_disk(
+        self, tmp_path
+    ):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "old_rt",
+            "accessToken": "old_at",
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        assert manager._refresh_token == "old_rt"
+
+        # Simulate Kiro IDE rotating the refresh token on disk
+        creds_file.write_text(json.dumps({
+            "refreshToken": "new_rt",
+            "accessToken": "new_at",
+        }))
+
+        changed = await manager.reload_credentials()
+
+        assert changed is True
+        assert manager._refresh_token == "new_rt"
+        assert manager._access_token == "new_at"
+
+    @pytest.mark.asyncio
+    async def test_reload_returns_false_when_disk_unchanged(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "accessToken": "at",
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        changed = await manager.reload_credentials()
+
+        assert changed is False
+
+    @pytest.mark.asyncio
+    async def test_reload_returns_false_when_no_backing_store(self):
+        manager = KiroAuthManager(refresh_token="env_only_rt")
+        changed = await manager.reload_credentials()
+        assert changed is False
+
+    @pytest.mark.asyncio
+    async def test_reload_swallows_io_errors_and_returns_false(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({"refreshToken": "rt"}))
+        manager = KiroAuthManager(creds_file=str(creds_file))
+
+        # Now point the manager at a path that doesn't exist
+        manager._creds_file = str(tmp_path / "missing.json")
+
+        # The internal loader logs a warning and returns; reload returns False
+        # because refresh_token did not change.
+        changed = await manager.reload_credentials()
+        assert changed is False
+
+    @pytest.mark.asyncio
+    async def test_reload_does_not_overwrite_explicit_region(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "rt",
+            "region": "ap-southeast-1",
+        }))
+
+        manager = KiroAuthManager(
+            region="us-east-1",
+            creds_file=str(creds_file),
+            region_explicit=True,
+        )
+
+        await manager.reload_credentials()
+
+        assert manager._region == "us-east-1"
+
+    @pytest.mark.asyncio
+    async def test_reload_acquires_lock_so_concurrent_refresh_serializes(
+        self, tmp_path
+    ):
+        """The background reload must not race with an in-flight network
+        refresh — both paths must take `self._lock`.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({"refreshToken": "rt"}))
+        manager = KiroAuthManager(creds_file=str(creds_file))
+
+        # Hold the lock while a reload is in flight; the reload must wait.
+        await manager._lock.acquire()
+        reload_task = asyncio.create_task(manager.reload_credentials())
+
+        # Give the event loop a chance — the task must not have completed.
+        await asyncio.sleep(0)
+        assert not reload_task.done(), "reload_credentials ran without the lock"
+
+        manager._lock.release()
+        result = await reload_task
+        assert result is False  # disk unchanged
+
+
+# =============================================================================
+# Tests for graceful degradation in creds_file mode (was SQLite-only before)
+# =============================================================================
+
+class TestKiroAuthManagerCredsFileGracefulDegradation:
+    """When refresh returns 400 (invalid_grant) but the in-memory access_token
+    is still valid, the gateway must keep using it instead of failing the
+    request — this now applies to JSON-file mode too, not just SQLite.
+    """
+
+    @pytest.mark.asyncio
+    async def test_creds_file_400_falls_back_to_unexpired_token(self, tmp_path):
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "stale_rt",
+            "accessToken": "still_valid_at",
+            # Expires soon enough that get_access_token tries to refresh,
+            # but not yet expired.
+            "expiresAt": (
+                datetime.now(timezone.utc) + timedelta(seconds=30)
+            ).isoformat().replace("+00:00", "Z"),
+            "clientId": "cid",
+            "clientSecret": "csec",
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        assert manager.is_token_expiring_soon() is True
+        assert manager.is_token_expired() is False
+
+        mock_error_response = AsyncMock()
+        mock_error_response.status_code = 400
+        mock_error_response.text = '{"error":"invalid_grant"}'
+        mock_error_response.json = Mock(return_value={"error": "invalid_grant"})
+        mock_error_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError(
+                "400 Bad Request",
+                request=Mock(),
+                response=mock_error_response,
+            )
+        )
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_error_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            token = await manager.get_access_token()
+
+        assert token == "still_valid_at"

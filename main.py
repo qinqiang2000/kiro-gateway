@@ -59,7 +59,9 @@ from kiro.config import (
     APP_VERSION,
     REFRESH_TOKEN,
     PROFILE_ARN,
+    PROFILE_ARN_EXPLICIT,
     REGION,
+    REGION_EXPLICIT,
     KIRO_CREDS_FILE,
     KIRO_CLI_DB_FILE,
     PROXY_API_KEY,
@@ -354,6 +356,8 @@ async def lifespan(app: FastAPI):
         region=REGION,
         creds_file=KIRO_CREDS_FILE if KIRO_CREDS_FILE else None,
         sqlite_db=KIRO_CLI_DB_FILE if KIRO_CLI_DB_FILE else None,
+        region_explicit=REGION_EXPLICIT,
+        profile_arn_explicit=PROFILE_ARN_EXPLICIT,
     )
     
     # Create model cache
@@ -431,19 +435,17 @@ async def lifespan(app: FastAPI):
     # Kiro IDE refreshes kiro-auth-token.json on disk automatically.
     # We reload it on the configured interval so the gateway picks up fresh tokens
     # without requiring a restart, even after the refresh_token rotates.
+    # reload_credentials() is async and acquires the auth manager's lock, so it
+    # safely interleaves with request-path refreshes.
     async def _credential_refresh_loop(auth_manager):
         while True:
             await asyncio.sleep(CRED_RELOAD_INTERVAL)
             try:
-                changed = auth_manager.reload_credentials()
-                if changed:
-                    logger.info("Credential refresh: new tokens loaded from disk")
-                else:
-                    # File unchanged - try an active refresh via the API
-                    await auth_manager.get_access_token()
-                    logger.debug("Credential refresh: token still valid")
+                await auth_manager.reload_credentials()
             except Exception as e:
-                logger.warning(f"Credential refresh: failed ({e}), will retry in {CRED_RELOAD_INTERVAL}s")
+                logger.warning(
+                    f"Credential refresh: failed ({e}), will retry in {CRED_RELOAD_INTERVAL}s"
+                )
 
     refresh_task = asyncio.create_task(
         _credential_refresh_loop(app.state.auth_manager)

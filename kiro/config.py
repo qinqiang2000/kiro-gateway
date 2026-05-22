@@ -129,12 +129,22 @@ VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 # Refresh token for updating access token
 REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
 
-# Profile ARN for AWS CodeWhisperer
-PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
+# Profile ARN for AWS CodeWhisperer.
+# PROFILE_ARN_EXPLICIT distinguishes "user explicitly set it" from
+# "fall back to whatever credentials file contains" so the credentials
+# file does not silently override an explicit value.
+_profile_arn_raw = os.getenv("PROFILE_ARN")
+PROFILE_ARN: str = _profile_arn_raw or ""
+PROFILE_ARN_EXPLICIT: bool = bool(_profile_arn_raw)
 
-# AWS region (default us-east-1)
+# AWS region (default us-east-1).
+# REGION_EXPLICIT mirrors PROFILE_ARN_EXPLICIT: it is True only when the
+# user actually set KIRO_REGION, so a credentials file's `region` field
+# can still populate REGION when the user did not specify one.
 DEFAULT_REGION: str = "us-east-1"
-REGION: str = os.getenv("KIRO_REGION", DEFAULT_REGION)
+_kiro_region_raw = os.getenv("KIRO_REGION")
+REGION: str = _kiro_region_raw or DEFAULT_REGION
+REGION_EXPLICIT: bool = bool(_kiro_region_raw)
 
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows
@@ -484,8 +494,13 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
 # Kiro IDE rotates the refresh_token periodically and writes the new token back to
 # kiro-auth-token.json.  The gateway reloads this file on the configured interval
 # so it always has a fresh refresh_token without requiring a restart.
-# Default: 1800 seconds (30 minutes)
-CRED_RELOAD_INTERVAL: int = int(os.getenv("CRED_RELOAD_INTERVAL", "1800"))
+# Default: 1800 seconds (30 minutes). Clamped to >= 60s to avoid tight loops
+# from typos like CRED_RELOAD_INTERVAL=0.
+_CRED_RELOAD_MIN: int = 60
+CRED_RELOAD_INTERVAL: int = max(
+    _CRED_RELOAD_MIN,
+    int(os.getenv("CRED_RELOAD_INTERVAL", "1800")),
+)
 
 
 # ==================================================================================================
