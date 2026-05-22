@@ -40,6 +40,7 @@ Priority: CLI args > Environment variables > Default values
 """
 
 import argparse
+import asyncio
 import logging
 import sys
 import os
@@ -73,6 +74,7 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    CRED_RELOAD_INTERVAL,
     _warn_timeout_configuration,
 )
 from kiro.auth import KiroAuthManager
@@ -424,10 +426,39 @@ async def lifespan(app: FastAPI):
         logger.debug(f"Model aliases configured: {list(MODEL_ALIASES.keys())}")
     if HIDDEN_FROM_LIST:
         logger.debug(f"Models hidden from list: {HIDDEN_FROM_LIST}")
-    
+
+    # --- Background credential refresh task ---
+    # Kiro IDE refreshes kiro-auth-token.json on disk automatically.
+    # We reload it on the configured interval so the gateway picks up fresh tokens
+    # without requiring a restart, even after the refresh_token rotates.
+    async def _credential_refresh_loop(auth_manager):
+        while True:
+            await asyncio.sleep(CRED_RELOAD_INTERVAL)
+            try:
+                changed = auth_manager.reload_credentials()
+                if changed:
+                    logger.info("Credential refresh: new tokens loaded from disk")
+                else:
+                    # File unchanged - try an active refresh via the API
+                    await auth_manager.get_access_token()
+                    logger.debug("Credential refresh: token still valid")
+            except Exception as e:
+                logger.warning(f"Credential refresh: failed ({e}), will retry in {CRED_RELOAD_INTERVAL}s")
+
+    refresh_task = asyncio.create_task(
+        _credential_refresh_loop(app.state.auth_manager)
+    )
+    logger.info(f"Background credential refresh task started (interval: {CRED_RELOAD_INTERVAL}s)")
+
     yield
-    
+
     # Graceful shutdown
+    refresh_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
+
     logger.info("Shutting down application...")
     try:
         await app.state.http_client.aclose()

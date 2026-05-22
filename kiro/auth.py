@@ -142,6 +142,12 @@ class KiroAuthManager:
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
         
+        # Track whether region/profile_arn were explicitly provided by caller
+        # (vs. default values). Used to prevent credentials file from overriding them.
+        from kiro.config import DEFAULT_REGION
+        self._region_explicit = (region != DEFAULT_REGION)
+        self._profile_arn_explicit = (profile_arn is not None)
+        
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
         self._client_secret: Optional[str] = client_secret
@@ -339,15 +345,17 @@ class KiroAuthManager:
                 self._refresh_token = data['refreshToken']
             if 'accessToken' in data:
                 self._access_token = data['accessToken']
-            if 'profileArn' in data:
+            if 'profileArn' in data and not self._profile_arn_explicit:
                 self._profile_arn = data['profileArn']
-            if 'region' in data:
+            if 'region' in data and not self._region_explicit:
                 self._region = data['region']
                 # Update URLs for new region
                 self._refresh_url = get_kiro_refresh_url(self._region)
                 self._api_host = get_kiro_api_host(self._region)
                 self._q_host = get_kiro_q_host(self._region)
                 logger.info(f"Region updated from credentials file: region={self._region}, api_host={self._api_host}, q_host={self._q_host}")
+            elif 'region' in data and self._region_explicit:
+                logger.debug(f"Region from credentials file ({data['region']}) ignored - using explicit region: {self._region}")
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
             if 'clientIdHash' in data:
@@ -780,42 +788,50 @@ class KiroAuthManager:
             if self._access_token and not self.is_token_expiring_soon():
                 return self._access_token
             
-            # SQLite mode: reload credentials first, kiro-cli might have updated them
-            if self._sqlite_db and self.is_token_expiring_soon():
-                logger.debug("SQLite mode: reloading credentials before refresh attempt")
-                self._load_credentials_from_sqlite(self._sqlite_db)
-                # Check if reloaded token is now valid
+            # Before attempting a network refresh, reload credentials from disk.
+            # Kiro IDE rotates the refresh_token and writes the new one back to the
+            # credentials file.  If we skip this step we'll try to use a stale
+            # refresh_token and get invalid_grant (400) from AWS SSO OIDC.
+            if self.is_token_expiring_soon():
+                if self._sqlite_db:
+                    logger.debug("Reloading credentials from SQLite before refresh")
+                    self._load_credentials_from_sqlite(self._sqlite_db)
+                elif self._creds_file:
+                    logger.debug("Reloading credentials from file before refresh")
+                    self._load_credentials_from_file(self._creds_file)
+                
+                # If the reloaded token is already fresh, skip the network call
                 if self._access_token and not self.is_token_expiring_soon():
-                    logger.debug("SQLite reload provided fresh token, no refresh needed")
+                    logger.debug("Reloaded credentials are still valid, no network refresh needed")
                     return self._access_token
             
             # Try to refresh the token
             try:
                 await self._refresh_token_request()
             except httpx.HTTPStatusError as e:
-                # Graceful degradation for SQLite mode when refresh fails twice
-                # This happens when kiro-cli refreshed tokens in memory without persisting
-                if e.response.status_code == 400 and self._sqlite_db:
+                # Graceful degradation when refresh fails with 400 (invalid_grant).
+                # This can happen when Kiro IDE rotated the refresh_token but the new
+                # one hasn't been written to disk yet.  Fall back to the current
+                # access_token if it hasn't actually expired yet.
+                if e.response.status_code == 400 and (self._sqlite_db or self._creds_file):
                     logger.warning(
-                        "Token refresh failed with 400 after SQLite reload. "
-                        "This may happen if kiro-cli refreshed tokens in memory without persisting."
+                        "Token refresh failed with 400 (invalid_grant) after credential reload. "
+                        "Kiro IDE may still be writing the new token to disk."
                     )
-                    # Check if access_token is still usable
                     if self._access_token and not self.is_token_expired():
                         logger.warning(
                             "Using existing access_token until it expires. "
-                            "Run 'kiro-cli login' when convenient to refresh credentials."
+                            "Will retry credential reload on the next request."
                         )
                         return self._access_token
                     else:
                         raise ValueError(
-                            "Token expired and refresh failed. "
-                            "Please run 'kiro-cli login' to refresh your credentials."
+                            "Token expired and refresh failed (invalid_grant). "
+                            "Please ensure Kiro IDE is running and logged in."
                         )
-                # Non-SQLite mode or non-400 error - propagate the exception
+                # Other errors - propagate
                 raise
             except Exception:
-                # For any other exception, propagate it
                 raise
             
             if not self._access_token:
@@ -828,13 +844,55 @@ class KiroAuthManager:
         Forces a token refresh.
         
         Used when receiving a 403 error from the API.
+        Reloads credentials from disk first so we pick up any token rotation
+        that Kiro IDE may have written since the last load.
         
         Returns:
             New access token
         """
         async with self._lock:
+            # Reload from disk first - Kiro IDE may have rotated the refresh_token
+            if self._sqlite_db:
+                logger.debug("force_refresh: reloading credentials from SQLite")
+                self._load_credentials_from_sqlite(self._sqlite_db)
+            elif self._creds_file:
+                logger.debug("force_refresh: reloading credentials from file")
+                self._load_credentials_from_file(self._creds_file)
             await self._refresh_token_request()
             return self._access_token
+
+    def reload_credentials(self) -> bool:
+        """
+        Reloads credentials from the configured file or SQLite database.
+
+        Called periodically by the background task to pick up tokens that
+        Kiro IDE has refreshed on disk.  Only reloads the refresh_token and
+        access_token fields; explicit region / profile_arn overrides are kept.
+
+        Returns:
+            True if new credentials were loaded, False otherwise.
+        """
+        old_refresh = self._refresh_token
+        old_access = self._access_token
+
+        try:
+            if self._sqlite_db:
+                self._load_credentials_from_sqlite(self._sqlite_db)
+            elif self._creds_file:
+                self._load_credentials_from_file(self._creds_file)
+            else:
+                return False
+        except Exception as e:
+            logger.warning(f"reload_credentials: failed to reload: {e}")
+            return False
+
+        changed = (
+            self._refresh_token != old_refresh
+            or self._access_token != old_access
+        )
+        if changed:
+            logger.info("reload_credentials: credentials updated from disk")
+        return changed
     
     @property
     def profile_arn(self) -> Optional[str]:

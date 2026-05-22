@@ -133,7 +133,8 @@ REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
 PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
 
 # AWS region (default us-east-1)
-REGION: str = os.getenv("KIRO_REGION", "us-east-1")
+DEFAULT_REGION: str = "us-east-1"
+REGION: str = os.getenv("KIRO_REGION", DEFAULT_REGION)
 
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows
@@ -473,6 +474,18 @@ FAKE_REASONING_OPEN_TAGS: List[str] = [
 FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
     os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20")
 )
+
+
+# ==================================================================================================
+# Credential Reload Settings
+# ==================================================================================================
+
+# Interval (seconds) for the background task that reloads credentials from disk.
+# Kiro IDE rotates the refresh_token periodically and writes the new token back to
+# kiro-auth-token.json.  The gateway reloads this file on the configured interval
+# so it always has a fresh refresh_token without requiring a restart.
+# Default: 1800 seconds (30 minutes)
+CRED_RELOAD_INTERVAL: int = int(os.getenv("CRED_RELOAD_INTERVAL", "1800"))
 
 
 # ==================================================================================================
