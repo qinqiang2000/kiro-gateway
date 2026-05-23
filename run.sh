@@ -19,13 +19,16 @@ Usage: ./run.sh <command> [options]
 
 Commands:
   start    [--port PORT] [--host HOST]   Start gateway in background
-  stop                                   Stop gateway
-  restart  [--port PORT] [--host HOST]   Restart gateway
+  stop     [--port PORT]                 Stop gateway
+  restart  [--port PORT] [--host HOST]   Restart gateway (default)
   status                                 Show running status
   log                                    Tail the log file (Ctrl+C to exit)
   help, -h, --help                       Show this help
 
+Default (no command): restart
+
 Examples:
+  ./run.sh                  # same as: ./run.sh restart
   ./run.sh start
   ./run.sh start --port 9000
   ./run.sh log
@@ -34,6 +37,42 @@ EOF
 
 is_running() {
     [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+get_port() {
+    local port=8000
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port=*) port="${1#--port=}"; shift ;;
+            --port)   port="${2:-8000}"; shift 2 ;;
+            *)        shift ;;
+        esac
+    done
+    echo "$port"
+}
+
+port_holder_pid() {
+    local pid
+    pid=$(lsof -tiTCP:"$1" -sTCP:LISTEN -n -P 2>/dev/null) || true
+    echo "${pid%%$'\n'*}"
+}
+
+free_port() {
+    local port="$1"
+    local pid
+    pid=$(port_holder_pid "$port")
+    [ -z "$pid" ] && return 0
+    echo "Port $port still held by PID $pid (orphan). Terminating..."
+    kill -TERM "$pid" 2>/dev/null || true
+    local wait_time=0
+    while kill -0 "$pid" 2>/dev/null && [ $wait_time -lt 5 ]; do
+        sleep 1
+        wait_time=$((wait_time + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  did not exit, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
 }
 
 rotate_log() {
@@ -49,6 +88,7 @@ cmd_start() {
         echo "Kiro Gateway is already running (PID: $(cat "$PID_FILE"))"
         exit 1
     fi
+    free_port "$(get_port "$@")"
     mkdir -p "$LOG_DIR"
     rotate_log
     set -m  # enable job control so & creates a new process group
@@ -70,6 +110,7 @@ cmd_stop() {
     if ! is_running; then
         echo "Kiro Gateway is not running"
         [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
+        free_port "$(get_port "$@")"
         return 0
     fi
     local PID
@@ -88,6 +129,7 @@ cmd_stop() {
         kill -KILL "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
+    free_port "$(get_port "$@")"
     echo "Kiro Gateway stopped"
 }
 
@@ -100,13 +142,13 @@ cmd_status() {
     fi
 }
 
-COMMAND="${1:-help}"
-shift || true
+COMMAND="${1:-restart}"
+[ $# -gt 0 ] && shift
 
 case "$COMMAND" in
     start)   cmd_start "$@" ;;
-    stop)    cmd_stop ;;
-    restart) cmd_stop; cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    restart) cmd_stop "$@"; cmd_start "$@" ;;
     status)  cmd_status ;;
     log)     tail -f "$LOG_FILE" ;;
     help|-h|--help|*)  show_help ;;
