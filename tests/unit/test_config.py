@@ -632,11 +632,13 @@ class TestFallbackModelsIntegration:
         resolver = ModelResolver(cache=cache, hidden_models={})
         
         print("\nAction: Testing normalization with dash format...")
-        # Test that dash format (claude-opus-4-5) is normalized and found
+        # Test that dash format is normalized and found.
+        # Models must exist in FALLBACK_MODELS — keep this list in sync with kiro/config.py.
         test_cases = [
-            ("claude-opus-4-5", "claude-opus-4.5"),  # Dash → Dot
-            ("claude-sonnet-4-5", "claude-sonnet-4.5"),  # Dash → Dot
             ("claude-haiku-4-5", "claude-haiku-4.5"),  # Dash → Dot
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-opus-4-6", "claude-opus-4.6"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
         ]
         
         for input_name, expected_normalized in test_cases:

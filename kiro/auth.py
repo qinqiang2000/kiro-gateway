@@ -367,7 +367,17 @@ class KiroAuthManager:
                 self._q_host = get_kiro_q_host(self._region)
                 logger.info(f"Region updated from credentials file: region={self._region}, api_host={self._api_host}, q_host={self._q_host}")
             elif 'region' in data and self._region_explicit:
-                logger.debug(f"Region from credentials file ({data['region']}) ignored - using explicit region: {self._region}")
+                # Keep the file's region as the SSO/OIDC region so token refresh
+                # stays on the region where the OIDC client was registered, even
+                # when the user has redirected API traffic with KIRO_REGION.
+                # Without this, setting KIRO_REGION=eu-central-1 would point
+                # OIDC refresh at oidc.eu-central-1.amazonaws.com and fail,
+                # because Kiro IDE registers OIDC clients in us-east-1.
+                self._sso_region = data['region']
+                logger.info(
+                    f"Using KIRO_REGION={self._region} for API calls; "
+                    f"keeping SSO/OIDC refresh on file region={data['region']}"
+                )
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
             if 'clientIdHash' in data:
