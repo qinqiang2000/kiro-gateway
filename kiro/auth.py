@@ -942,6 +942,37 @@ class KiroAuthManager:
                 logger.info("reload_credentials: credentials updated from disk")
             return changed
     
+    def set_region(self, region: str) -> None:
+        """
+        Update the API region and all derived URLs.
+
+        Used by the startup region auto-detection probe to switch the API
+        host to whichever region answers ListAvailableModels.
+
+        Side effects:
+        - Marks the region as explicit so subsequent credential reloads do
+          NOT overwrite it with the file's ``region`` field. Without this,
+          the next ``_load_credentials_from_file()`` call (triggered by a
+          403 retry or the background reload task) would clobber our pick.
+        - Preserves the previous region as ``_sso_region`` when none was
+          set yet, so OIDC token refresh continues using the region where
+          the OIDC client was registered (typically the creds-file region).
+
+        Args:
+            region: AWS region (e.g., "us-east-1", "eu-central-1")
+        """
+        if self._sso_region is None and self._region != region:
+            self._sso_region = self._region
+        self._region = region
+        self._refresh_url = get_kiro_refresh_url(region)
+        self._api_host = get_kiro_api_host(region)
+        self._q_host = get_kiro_q_host(region)
+        self._region_explicit = True
+        logger.info(
+            f"Region set to {region}: api_host={self._api_host}, q_host={self._q_host}, "
+            f"sso_region={self._sso_region or self._region}"
+        )
+
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""

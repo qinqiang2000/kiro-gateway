@@ -146,6 +146,24 @@ _kiro_region_raw = os.getenv("KIRO_REGION")
 REGION: str = _kiro_region_raw or DEFAULT_REGION
 REGION_EXPLICIT: bool = bool(_kiro_region_raw)
 
+# Candidate regions tried in order at startup when neither KIRO_REGION nor
+# the credentials file pin a region. First region whose ListAvailableModels
+# returns 200 (or 401/403 - reachable but unauthenticated) wins. AWS Q
+# currently only ships in us-east-1 and eu-central-1; list is configurable
+# so new regions can be added without a code change.
+_kiro_region_candidates_raw = os.getenv(
+    "KIRO_REGION_CANDIDATES",
+    "us-east-1,eu-central-1",
+)
+KIRO_REGION_CANDIDATES: List[str] = [
+    r.strip() for r in _kiro_region_candidates_raw.split(",") if r.strip()
+]
+
+# Master switch for the startup region probe. Default: enabled.
+KIRO_REGION_AUTODETECT: bool = os.getenv(
+    "KIRO_REGION_AUTODETECT", "true"
+).lower() in ("true", "1", "yes", "on")
+
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)

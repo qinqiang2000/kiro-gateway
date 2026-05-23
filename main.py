@@ -62,6 +62,8 @@ from kiro.config import (
     PROFILE_ARN_EXPLICIT,
     REGION,
     REGION_EXPLICIT,
+    KIRO_REGION_CANDIDATES,
+    KIRO_REGION_AUTODETECT,
     KIRO_CREDS_FILE,
     KIRO_CLI_DB_FILE,
     PROXY_API_KEY,
@@ -81,6 +83,7 @@ from kiro.config import (
 )
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
+from kiro.config import get_kiro_q_host
 from kiro.model_resolver import ModelResolver
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
@@ -310,6 +313,70 @@ def validate_configuration() -> None:
 
 
 # --- Lifespan Manager ---
+async def _detect_api_region(
+    auth_manager: "KiroAuthManager",
+    candidates: list,
+) -> tuple[str, dict] | tuple[None, None]:
+    """
+    Probe candidate AWS regions via ListAvailableModels to find the one that
+    serves this account.
+
+    AWS Q has no public "ListRegions" API, so we use ListAvailableModels as
+    a region probe: whichever region returns 200 is the account's API
+    region. 401/403/404 mean "this region doesn't serve your account" -
+    AWS Q rejects cross-region calls with 403, so we must keep trying the
+    next candidate rather than accept the first reachable host.
+
+    Args:
+        auth_manager: Authentication manager (used to get an access token and
+                      profile_arn)
+        candidates: Candidate regions to try in order
+
+    Returns:
+        Tuple of (region, models_response) on success - models_response is the
+        parsed JSON body of the 200 response so the caller can reuse it instead
+        of refetching. Returns (None, None) when no candidate responds.
+    """
+    from kiro.utils import get_kiro_headers
+    from kiro.auth import AuthType
+
+    try:
+        token = await auth_manager.get_access_token()
+    except Exception as e:
+        logger.warning(f"Region auto-detect: cannot get access token ({e}), skipping probe")
+        return None, None
+
+    headers = get_kiro_headers(auth_manager, token)
+    params = {"origin": "AI_EDITOR"}
+    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+        params["profileArn"] = auth_manager.profile_arn
+
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+
+    for region in candidates:
+        url = f"{get_kiro_q_host(region)}/ListAvailableModels"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                response = await client.get(url, headers=headers, params=params)
+
+            if response.status_code == 200:
+                logger.info(f"Region auto-detect: {region} matched (HTTP 200)")
+                return region, response.json()
+            # 403 = AWS Q's "your account isn't in this region" signal;
+            # keep trying the next candidate.
+            logger.info(
+                f"Region auto-detect: {region} rejected (HTTP {response.status_code}), trying next"
+            )
+        except httpx.RequestError as e:
+            logger.debug(f"Region auto-detect: {region} network error ({e}), trying next")
+
+    logger.warning(
+        f"Region auto-detect: none of {candidates} responded; "
+        f"keeping current region={auth_manager.region}"
+    )
+    return None, None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -359,50 +426,78 @@ async def lifespan(app: FastAPI):
         region_explicit=REGION_EXPLICIT,
         profile_arn_explicit=PROFILE_ARN_EXPLICIT,
     )
-    
+
     # Create model cache
     app.state.model_cache = ModelInfoCache()
-    
+
+    # --- Region auto-detection ---
+    # Probe candidate regions only when the user has not pinned KIRO_REGION
+    # explicitly. We deliberately do NOT skip when KIRO_CREDS_FILE is set:
+    # Kiro IDE writes the OIDC client's registration region into the creds
+    # file (often us-east-1) even when the account's Q API actually lives in
+    # eu-central-1. The probe is what tells us which region the API works in.
+    # Captures the probe response so we can skip the second
+    # ListAvailableModels request below.
+    probed_models_response = None
+    should_probe = (
+        KIRO_REGION_AUTODETECT
+        and not REGION_EXPLICIT
+    )
+    if should_probe and len(KIRO_REGION_CANDIDATES) > 0:
+        logger.info(f"Region auto-detect enabled, candidates: {KIRO_REGION_CANDIDATES}")
+        detected_region, probed_models_response = await _detect_api_region(
+            auth_manager=app.state.auth_manager,
+            candidates=KIRO_REGION_CANDIDATES,
+        )
+        if detected_region and detected_region != app.state.auth_manager.region:
+            app.state.auth_manager.set_region(detected_region)
+
     # BLOCKING: Load models from Kiro API at startup
     # This ensures the cache is populated BEFORE accepting any requests.
     # No race conditions - requests only start after yield.
-    logger.info("Loading models from Kiro API...")
-    try:
-        token = await app.state.auth_manager.get_access_token()
-        from kiro.utils import get_kiro_headers
-        from kiro.auth import AuthType
-        headers = get_kiro_headers(app.state.auth_manager, token)
-        
-        # Build params - profileArn is only needed for Kiro Desktop auth
-        params = {"origin": "AI_EDITOR"}
-        if app.state.auth_manager.auth_type == AuthType.KIRO_DESKTOP and app.state.auth_manager.profile_arn:
-            params["profileArn"] = app.state.auth_manager.profile_arn
-        
-        list_models_url = f"{app.state.auth_manager.q_host}/ListAvailableModels"
-        logger.debug(f"Fetching models from: {list_models_url}")
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                list_models_url,
-                headers=headers,
-                params=params
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                models_list = data.get("models", [])
-                await app.state.model_cache.update(models_list)
-                logger.debug(f"Successfully loaded {len(models_list)} models from Kiro API")
-            else:
-                raise Exception(f"HTTP {response.status_code}")
-    except Exception as e:
-        # FALLBACK: Use built-in model list
-        logger.error(f"Failed to fetch models from Kiro API: {e}")
-        logger.error("Using pre-configured fallback models. Not all models may be available on your plan, or the list may be outdated.")
-        
-        # Populate cache with fallback models
-        await app.state.model_cache.update(FALLBACK_MODELS)
-        logger.debug(f"Loaded {len(FALLBACK_MODELS)} fallback models")
+    if probed_models_response is not None:
+        # Reuse the 200 response from the region probe to avoid a second call.
+        models_list = probed_models_response.get("models", [])
+        await app.state.model_cache.update(models_list)
+        logger.info(f"Loaded {len(models_list)} models from region probe response")
+    else:
+        logger.info("Loading models from Kiro API...")
+        try:
+            token = await app.state.auth_manager.get_access_token()
+            from kiro.utils import get_kiro_headers
+            from kiro.auth import AuthType
+            headers = get_kiro_headers(app.state.auth_manager, token)
+
+            # Build params - profileArn is only needed for Kiro Desktop auth
+            params = {"origin": "AI_EDITOR"}
+            if app.state.auth_manager.auth_type == AuthType.KIRO_DESKTOP and app.state.auth_manager.profile_arn:
+                params["profileArn"] = app.state.auth_manager.profile_arn
+
+            list_models_url = f"{app.state.auth_manager.q_host}/ListAvailableModels"
+            logger.debug(f"Fetching models from: {list_models_url}")
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    list_models_url,
+                    headers=headers,
+                    params=params
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    models_list = data.get("models", [])
+                    await app.state.model_cache.update(models_list)
+                    logger.debug(f"Successfully loaded {len(models_list)} models from Kiro API")
+                else:
+                    raise Exception(f"HTTP {response.status_code}")
+        except Exception as e:
+            # FALLBACK: Use built-in model list
+            logger.error(f"Failed to fetch models from Kiro API: {e}")
+            logger.error("Using pre-configured fallback models. Not all models may be available on your plan, or the list may be outdated.")
+
+            # Populate cache with fallback models
+            await app.state.model_cache.update(FALLBACK_MODELS)
+            logger.debug(f"Loaded {len(FALLBACK_MODELS)} fallback models")
     
     # Add hidden models to cache (they appear in /v1/models but not in Kiro API)
     # Hidden models are added ALWAYS, regardless of API success/failure
