@@ -108,14 +108,14 @@ claude
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer 123" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "你好"}], "stream": true}'
+  -d '{"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "你好"}], "stream": true}'
 
 # Anthropic 接口
 curl http://localhost:8000/v1/messages \
   -H "x-api-key: 123" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": [{"role": "user", "content": "你好"}]}'
+  -d '{"model": "claude-sonnet-4-6", "max_tokens": 1024, "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
 ---
