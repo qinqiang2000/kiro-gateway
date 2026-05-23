@@ -36,3 +36,6 @@ log/
 
 # Systemd (generated from template, not committed)
 systemd/kiro-gateway.service
+
+# Claude Code local settings (per-machine, not committed)
+.claude/settings.local.json
