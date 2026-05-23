@@ -30,12 +30,13 @@ Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 
 import json
 import time
-from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Awaitable, Callable, Dict, Optional
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
+from kiro.converters_core import restore_tool_name
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.utils import generate_completion_id
 from kiro.config import (
@@ -78,7 +79,8 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -203,6 +205,15 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+
+        # Restore original tool names for any names the gateway shortened to fit
+        # Kiro's 64-char limit, so the client sees the names it sent.
+        if tool_name_map:
+            for tc in all_tool_calls:
+                func = tc.get("function") or {}
+                short_name = func.get("name") or ""
+                if short_name:
+                    func["name"] = restore_tool_name(short_name, tool_name_map)
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (
@@ -375,7 +386,8 @@ async def stream_kiro_to_openai(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to OpenAI format.
@@ -398,7 +410,8 @@ async def stream_kiro_to_openai(
     async for chunk in stream_kiro_to_openai_internal(
         client, response, model, model_cache, auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        tool_name_map=tool_name_map,
     ):
         yield chunk
 
@@ -494,7 +507,8 @@ async def collect_stream_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -527,7 +541,8 @@ async def collect_stream_response(
         model_cache,
         auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        tool_name_map=tool_name_map,
     ):
         if not chunk_str.startswith("data:"):
             continue

@@ -333,6 +333,28 @@ TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in 
 )
 
 # ==================================================================================================
+# Tool Name Shortening
+# ==================================================================================================
+
+# When a tool name exceeds Kiro's tool-name length cap, the gateway
+# transparently shortens it (``prefix_<sha1[:8]>``) before sending to Kiro and
+# restores the original name in the response. The cap itself lives in
+# ``kiro/converters_core.py`` as ``KIRO_TOOL_NAME_MAX_LENGTH``.
+#
+# Default: true (enabled). An e2e probe with the cap raised to 128 confirmed
+# that Kiro rejects ~76-char tool names with a vague ``Improperly formed
+# request`` error -- this flag exists so the gateway can absorb that limit
+# transparently instead of failing the request (PR #41 originally rejected
+# such names with a 400). Set to ``false`` to fall back to pass-through and
+# let Kiro do its own validation.
+TOOL_NAME_SHORTENING: bool = os.getenv("TOOL_NAME_SHORTENING", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
+)
+
+# ==================================================================================================
 # Logging Settings
 # ==================================================================================================
 

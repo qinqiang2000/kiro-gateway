@@ -47,6 +47,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
+from kiro.converters_core import restore_tool_name
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
@@ -105,7 +106,8 @@ async def stream_kiro_to_anthropic(
     auth_manager: "KiroAuthManager",
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -299,7 +301,10 @@ async def stream_kiro_to_anthropic(
                 
                 tool = event.tool_use
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-                tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
+                tool_name = restore_tool_name(
+                    tool.get("function", {}).get("name", "") or tool.get("name", ""),
+                    tool_name_map,
+                )
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
                 
                 # Check if this tool was truncated
@@ -382,7 +387,10 @@ async def stream_kiro_to_anthropic(
             
             for tc in bracket_tool_calls:
                 tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-                tool_name = tc.get("function", {}).get("name", "")
+                tool_name = restore_tool_name(
+                    tc.get("function", {}).get("name", ""),
+                    tool_name_map,
+                )
                 tool_input = tc.get("function", {}).get("arguments", {})
                 
                 if isinstance(tool_input, str):
@@ -545,7 +553,8 @@ async def collect_anthropic_response(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
-    request_messages: Optional[list] = None
+    request_messages: Optional[list] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -598,7 +607,10 @@ async def collect_anthropic_response(
     # Add tool use blocks
     for tc in result.tool_calls:
         tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-        tool_name = tc.get("function", {}).get("name", "") or tc.get("name", "")
+        tool_name = restore_tool_name(
+            tc.get("function", {}).get("name", "") or tc.get("name", ""),
+            tool_name_map,
+        )
         tool_input = tc.get("function", {}).get("arguments", {}) or tc.get("input", {})
         
         if isinstance(tool_input, str):

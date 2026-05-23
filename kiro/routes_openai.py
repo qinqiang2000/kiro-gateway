@@ -240,7 +240,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         profile_arn_for_payload = auth_manager.profile_arn
     
     try:
-        kiro_payload = build_kiro_payload(
+        kiro_payload, tool_name_map = build_kiro_payload(
             request_data,
             conversation_id,
             profile_arn_for_payload
@@ -342,7 +342,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         model_cache,
                         auth_manager,
                         request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
+                        request_tools=tools_for_tokenizer,
+                        tool_name_map=tool_name_map,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -388,7 +389,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 model_cache,
                 auth_manager,
                 request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
+                request_tools=tools_for_tokenizer,
+                tool_name_map=tool_name_map,
             )
             
             await http_client.close()

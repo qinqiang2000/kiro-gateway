@@ -257,7 +257,7 @@ async def messages(
         profile_arn_for_payload = auth_manager.profile_arn
     
     try:
-        kiro_payload = anthropic_to_kiro(
+        kiro_payload, tool_name_map = anthropic_to_kiro(
             request_data,
             conversation_id,
             profile_arn_for_payload
@@ -368,7 +368,8 @@ async def messages(
                         request_data.model,
                         model_cache,
                         auth_manager,
-                        request_messages=messages_for_tokenizer
+                        request_messages=messages_for_tokenizer,
+                        tool_name_map=tool_name_map,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -415,7 +416,8 @@ async def messages(
                 request_data.model,
                 model_cache,
                 auth_manager,
-                request_messages=messages_for_tokenizer
+                request_messages=messages_for_tokenizer,
+                tool_name_map=tool_name_map,
             )
             
             await http_client.close()

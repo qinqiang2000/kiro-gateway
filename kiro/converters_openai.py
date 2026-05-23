@@ -300,21 +300,26 @@ def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
     profile_arn: str
-) -> dict:
+) -> Tuple[dict, Dict[str, str]]:
     """
     Builds complete payload for Kiro API from OpenAI request.
-    
+
     This is the main entry point for OpenAI → Kiro conversion.
     Uses the core build_kiro_payload function with OpenAI-specific adapters.
-    
+
     Args:
         request_data: Request in OpenAI format
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
-    
+
     Returns:
-        Payload dictionary for POST request to Kiro API
-    
+        Tuple of:
+        - Payload dictionary for POST request to Kiro API
+        - ``tool_name_map`` (``short -> original``) for any tool names that had
+          to be shortened to fit Kiro's 64-char limit. Empty when no
+          shortening was needed; routes must pass this to the streaming layer
+          so client-facing tool names match what the client sent.
+
     Raises:
         ValueError: If there are no messages to send
     """
@@ -344,5 +349,5 @@ def build_kiro_payload(
         profile_arn=profile_arn,
         inject_thinking=True
     )
-    
-    return result.payload
+
+    return result.payload, result.tool_name_map

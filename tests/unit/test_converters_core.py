@@ -5918,205 +5918,263 @@ class TestBuildKiroPayloadImages:
 
 
 # ==================================================================================================
-# Tests for validate_tool_names (Issue #41 fix)
+# Tests for shorten_long_tool_names (Issue #41 fix: transparent name shortening)
 # ==================================================================================================
 
-class TestValidateToolNames:
+class TestShortenLongToolNames:
     """
-    Tests for validate_tool_names function.
-    
-    This function validates tool names against Kiro API 64-character limit.
-    Issue #41: 400 Improperly formed request with long tool names from MCP servers.
+    Tests for ``shorten_long_tool_names`` and ``restore_tool_name``.
+
+    The gateway must accept tool names that exceed Kiro's ``KIRO_TOOL_NAME_MAX_LENGTH``
+    by transparently shortening them before sending to Kiro and restoring the
+    original names in the response. Tests use the live constant so they stay
+    correct if the limit is re-tuned.
     """
-    
-    def test_accepts_short_tool_names(self):
+
+    def test_passes_through_short_names_unchanged(self):
+        """Names within the limit must not be shortened."""
+        from kiro.converters_core import shorten_long_tool_names
+
+        tools = [UnifiedTool(name="get_weather", description="Test")]
+        processed, name_map = shorten_long_tool_names(tools)
+
+        assert name_map == {}
+        assert processed[0].name == "get_weather"
+        # Same object reused (no needless copy) when no shortening was needed.
+        assert processed[0] is tools[0]
+
+    def test_passes_through_name_at_exact_limit(self):
+        """Boundary: a name of exactly KIRO_TOOL_NAME_MAX_LENGTH chars must NOT be shortened."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        name_at_limit = "a" * KIRO_TOOL_NAME_MAX_LENGTH
+        processed, name_map = shorten_long_tool_names(
+            [UnifiedTool(name=name_at_limit, description="Test")]
+        )
+
+        assert name_map == {}
+        assert processed[0].name == name_at_limit
+
+    def test_shortens_name_one_over_limit(self):
+        """A name one char over the limit is shortened to within the limit."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        over_limit = "a" * (KIRO_TOOL_NAME_MAX_LENGTH + 1)
+        processed, name_map = shorten_long_tool_names(
+            [UnifiedTool(name=over_limit, description="Test")]
+        )
+
+        assert len(name_map) == 1
+        short = processed[0].name
+        assert len(short) <= KIRO_TOOL_NAME_MAX_LENGTH
+        assert name_map[short] == over_limit
+
+    def test_shortens_very_long_synthetic_name(self):
+        """A name well beyond the limit is shortened and remembered."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        long_name = "mcp__GitHub__" + "x" * (KIRO_TOOL_NAME_MAX_LENGTH * 2)
+        processed, name_map = shorten_long_tool_names(
+            [UnifiedTool(name=long_name, description="Test")]
+        )
+
+        short = processed[0].name
+        assert len(short) <= KIRO_TOOL_NAME_MAX_LENGTH
+        assert name_map[short] == long_name
+
+    def test_shortening_is_deterministic(self):
+        """Same input must produce the same short name across calls."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        long_name = "tool_" + "a" * (KIRO_TOOL_NAME_MAX_LENGTH + 10)
+        a, _ = shorten_long_tool_names([UnifiedTool(name=long_name, description="x")])
+        b, _ = shorten_long_tool_names([UnifiedTool(name=long_name, description="x")])
+
+        assert a[0].name == b[0].name
+
+    def test_does_not_collide_for_shared_prefix(self):
+        """Two names sharing a very long common prefix still produce distinct shorts."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        # Force shared prefix to overflow the prefix budget so only the
+        # hash distinguishes the two names.
+        prefix = "p" * (KIRO_TOOL_NAME_MAX_LENGTH + 10)
+        name_a = prefix + "_alpha"
+        name_b = prefix + "_beta"
+
+        processed, name_map = shorten_long_tool_names([
+            UnifiedTool(name=name_a, description="a"),
+            UnifiedTool(name=name_b, description="b"),
+        ])
+
+        assert processed[0].name != processed[1].name
+        assert len(name_map) == 2
+        assert name_map[processed[0].name] == name_a
+        assert name_map[processed[1].name] == name_b
+
+    def test_does_not_mutate_input_tools(self):
+        """The original UnifiedTool objects must not be mutated."""
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, shorten_long_tool_names
+
+        original_name = "x" * (KIRO_TOOL_NAME_MAX_LENGTH + 20)
+        original = UnifiedTool(name=original_name, description="Test")
+        shorten_long_tool_names([original])
+
+        assert original.name == original_name
+
+    def test_handles_none_and_empty(self):
+        from kiro.converters_core import shorten_long_tool_names
+
+        processed_none, map_none = shorten_long_tool_names(None)
+        assert processed_none is None
+        assert map_none == {}
+
+        processed_empty, map_empty = shorten_long_tool_names([])
+        assert processed_empty == []
+        assert map_empty == {}
+
+    def test_restore_tool_name_maps_short_back_to_original(self):
+        from kiro.converters_core import (
+            KIRO_TOOL_NAME_MAX_LENGTH,
+            restore_tool_name,
+            shorten_long_tool_names,
+        )
+
+        original = "mcp__server__" + "y" * (KIRO_TOOL_NAME_MAX_LENGTH + 5)
+        processed, name_map = shorten_long_tool_names(
+            [UnifiedTool(name=original, description="x")]
+        )
+
+        assert restore_tool_name(processed[0].name, name_map) == original
+
+    def test_restore_tool_name_passes_through_unknown(self):
+        from kiro.converters_core import restore_tool_name
+
+        # Unknown names and empty maps are no-ops.
+        assert restore_tool_name("get_weather", {}) == "get_weather"
+        assert restore_tool_name("get_weather", None) == "get_weather"
+        assert restore_tool_name("unknown", {"other": "x"}) == "unknown"
+
+    def test_build_kiro_payload_passes_long_names_through_when_flag_off(self):
         """
-        What it does: Verifies that short tool names are accepted.
-        Purpose: Ensure normal tool names pass validation.
+        Default config (TOOL_NAME_SHORTENING=False): a name beyond the cap is
+        forwarded to Kiro untouched and the map stays empty. Kiro is the final
+        arbiter of name validity in this mode.
         """
-        print("Setup: Tool with short name...")
-        tools = [UnifiedTool(name="get_weather", description="Get weather")]
-        
-        print("Action: Validating tool names...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            print("Validation passed - OK")
-        except ValueError as e:
-            print(f"ERROR: Validation failed: {e}")
-            raise AssertionError("Short tool names should be accepted")
-    
-    def test_accepts_exactly_64_character_name(self):
+        from unittest.mock import patch
+
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, build_kiro_payload
+
+        long_name = "mcp__server__" + "k" * (KIRO_TOOL_NAME_MAX_LENGTH + 5)
+        messages = [UnifiedMessage(role="user", content="hello")]
+        tools = [UnifiedTool(name=long_name, description="d", input_schema={"type": "object"})]
+
+        with patch("kiro.converters_core.TOOL_NAME_SHORTENING", False):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="claude-sonnet-4",
+                tools=tools,
+                conversation_id="conv-1",
+                profile_arn="",
+            )
+
+        assert result.tool_name_map == {}
+        kiro_tools = (
+            result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["tools"]
+        )
+        assert kiro_tools[0]["toolSpecification"]["name"] == long_name
+
+    def test_build_kiro_payload_returns_name_map_for_long_tools(self):
+        """End-to-end: long tool names survive build_kiro_payload and map is returned."""
+        from unittest.mock import patch
+
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, build_kiro_payload
+
+        long_name = "mcp__server__" + "z" * (KIRO_TOOL_NAME_MAX_LENGTH + 5)
+        messages = [UnifiedMessage(role="user", content="hello")]
+        tools = [UnifiedTool(name=long_name, description="d", input_schema={"type": "object"})]
+
+        with patch("kiro.converters_core.TOOL_NAME_SHORTENING", True):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="claude-sonnet-4",
+                tools=tools,
+                conversation_id="conv-1",
+                profile_arn="",
+            )
+
+        # Map is populated and points back to the original name.
+        assert len(result.tool_name_map) == 1
+        short = next(iter(result.tool_name_map))
+        assert result.tool_name_map[short] == long_name
+
+        # Tool sent to Kiro uses the short name (fits the limit).
+        kiro_tools = (
+            result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["tools"]
+        )
+        assert len(kiro_tools) == 1
+        kiro_name = kiro_tools[0]["toolSpecification"]["name"]
+        assert len(kiro_name) <= KIRO_TOOL_NAME_MAX_LENGTH
+        assert kiro_name == short
+
+    def test_build_kiro_payload_rewrites_history_tool_uses(self):
         """
-        What it does: Verifies that exactly 64-character names are accepted (boundary).
-        Purpose: Ensure boundary case is handled correctly.
+        Historical assistant ``toolUses`` echoed back by the client use the
+        original (long) name; the gateway must rewrite them to the short
+        name so they match what Kiro saw in the original turn.
         """
-        print("Setup: Tool with exactly 64-character name...")
-        name_64 = "a" * 64
-        tools = [UnifiedTool(name=name_64, description="Test")]
-        
-        print(f"Tool name length: {len(name_64)}")
-        print("Action: Validating tool names...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            print("Validation passed - OK")
-        except ValueError as e:
-            print(f"ERROR: Validation failed: {e}")
-            raise AssertionError("64-character names should be accepted")
-    
-    def test_rejects_65_character_name(self):
-        """
-        What it does: Verifies that 65-character names are rejected.
-        Purpose: Ensure names exceeding limit are caught.
-        """
-        print("Setup: Tool with 65-character name...")
-        name_65 = "a" * 65
-        tools = [UnifiedTool(name=name_65, description="Test")]
-        
-        print(f"Tool name length: {len(name_65)}")
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            print("ERROR: Validation passed but should have failed")
-            raise AssertionError("65-character names should be rejected")
-        except ValueError as e:
-            print(f"Validation correctly rejected: {str(e)[:100]}...")
-            assert "exceed Kiro API limit" in str(e)
-            assert name_65 in str(e)
-    
-    def test_rejects_very_long_tool_names(self):
-        """
-        What it does: Verifies that very long tool names are rejected.
-        Purpose: Ensure the validation works for extreme cases.
-        """
-        print("Setup: Tool with 100-character name...")
-        name_100 = "mcp__GitHub__" + "a" * 87
-        tools = [UnifiedTool(name=name_100, description="Test")]
-        
-        print(f"Tool name length: {len(name_100)}")
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Very long names should be rejected")
-        except ValueError as e:
-            print(f"Validation correctly rejected: {str(e)[:100]}...")
-            assert "exceed Kiro API limit" in str(e)
-            assert "100 characters" in str(e)
-    
-    def test_rejects_multiple_long_names(self):
-        """
-        What it does: Verifies that all long names are listed in error message.
-        Purpose: Ensure user sees all problematic tools at once.
-        """
-        print("Setup: Multiple tools with long names...")
-        tools = [
-            UnifiedTool(name="a" * 65, description="Test 1"),
-            UnifiedTool(name="short", description="Test 2"),
-            UnifiedTool(name="b" * 70, description="Test 3")
+        from unittest.mock import patch
+
+        from kiro.converters_core import KIRO_TOOL_NAME_MAX_LENGTH, build_kiro_payload
+
+        long_name = "mcp__server__" + "h" * (KIRO_TOOL_NAME_MAX_LENGTH + 5)
+
+        messages = [
+            UnifiedMessage(role="user", content="please call the tool"),
+            UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": long_name, "arguments": "{}"},
+                }],
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{"tool_use_id": "call_1", "content": "ok"}],
+            ),
         ]
-        
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject multiple long names")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message: {error_msg[:200]}...")
-            
-            print("Checking that both long names are listed...")
-            assert "65 characters" in error_msg
-            assert "70 characters" in error_msg
-    
-    def test_handles_none_tools(self):
-        """
-        What it does: Verifies that None tools list is handled gracefully.
-        Purpose: Ensure function doesn't crash on None input.
-        """
-        print("Setup: None tools...")
-        
-        print("Action: Validating None...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(None)
-            print("Validation passed - OK")
-        except Exception as e:
-            print(f"ERROR: Unexpected exception: {e}")
-            raise AssertionError("None should be handled gracefully")
-    
-    def test_handles_empty_tools_list(self):
-        """
-        What it does: Verifies that empty tools list is handled gracefully.
-        Purpose: Ensure function doesn't crash on empty list.
-        """
-        print("Setup: Empty tools list...")
-        
-        print("Action: Validating empty list...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names([])
-            print("Validation passed - OK")
-        except Exception as e:
-            print(f"ERROR: Unexpected exception: {e}")
-            raise AssertionError("Empty list should be handled gracefully")
-    
-    def test_error_message_includes_solution(self):
-        """
-        What it does: Verifies that error message includes solution guidance.
-        Purpose: Ensure user knows how to fix the problem.
-        """
-        print("Setup: Tool with long name...")
-        tools = [UnifiedTool(name="mcp__GitHub__" + "a" * 60, description="Test")]
-        
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject long name")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message: {error_msg[:300]}...")
-            
-            print("Checking that error message includes solution...")
-            assert "Solution:" in error_msg
-            assert "64 characters" in error_msg
-            assert "Example:" in error_msg
-    
-    def test_real_world_mcp_tool_names(self):
-        """
-        What it does: Verifies rejection of real MCP tool names from Issue #41.
-        Purpose: Ensure the fix works for actual problematic tool names.
-        """
-        print("Setup: Real MCP tool names from Issue #41...")
-        problematic_names = [
-            "mcp__GitHub__check_if_a_person_is_followed_by_the_authenticated_user",
-            "mcp__GitHub__check_if_a_repository_is_starred_by_the_authenticated_user",
-            "mcp__GitHub__remove_interaction_restrictions_from_your_public_repositories",
+        tools = [UnifiedTool(name=long_name, description="d", input_schema={"type": "object"})]
+
+        with patch("kiro.converters_core.TOOL_NAME_SHORTENING", True):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="claude-sonnet-4",
+                tools=tools,
+                conversation_id="conv-1",
+                profile_arn="",
+            )
+
+        short = next(iter(result.tool_name_map))
+        history = result.payload["conversationState"]["history"]
+
+        # Find the assistant message in history and check its toolUses use the short name.
+        assistant_messages = [
+            msg["assistantResponseMessage"]
+            for msg in history
+            if "assistantResponseMessage" in msg
         ]
-        
-        tools = [UnifiedTool(name=name, description="Test") for name in problematic_names]
-        
-        print("Action: Validating real MCP tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject real MCP tool names")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message length: {len(error_msg)} chars")
-            print(f"Error message: {error_msg[:400]}...")
-            
-            print("Checking that all problematic names are listed...")
-            for name in problematic_names:
-                assert name in error_msg, f"Tool name '{name}' should be in error message"
-            
-            print("Checking that character counts are shown...")
-            assert "68 characters" in error_msg
-            assert "71 characters" in error_msg
-            assert "74 characters" in error_msg
+        assert assistant_messages, "expected an assistant message in history"
+        tool_uses = assistant_messages[0].get("toolUses", [])
+        assert tool_uses, "expected toolUses on the historical assistant message"
+        assert tool_uses[0]["name"] == short
 
 
 # ==================================================================================================
