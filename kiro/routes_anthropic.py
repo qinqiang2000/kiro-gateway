@@ -90,12 +90,20 @@ async def verify_anthropic_api_key(
     # Check x-api-key first (Anthropic native)
     if x_api_key and x_api_key == PROXY_API_KEY:
         return True
-    
+
     # Fall back to Authorization: Bearer
     if authorization and authorization == f"Bearer {PROXY_API_KEY}":
         return True
-    
-    logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
+
+    def _redact(value: Optional[str], keep: int = 4) -> str:
+        if not value:
+            return "<missing>"
+        return f"{value[:keep]}…(len={len(value)})"
+
+    logger.warning(
+        "Access attempt with invalid API key (Anthropic endpoint) | "
+        f"x-api-key={_redact(x_api_key)} | authorization={_redact(authorization, keep=16)}"
+    )
     raise HTTPException(
         status_code=401,
         detail={

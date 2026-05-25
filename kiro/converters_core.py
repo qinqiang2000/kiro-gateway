@@ -567,7 +567,7 @@ def shorten_long_tool_names(
                     f"'{name_map[short]}' both map to '{short}'"
                 )
             name_map[short] = tool.name
-            logger.warning(
+            logger.debug(
                 f"Shortened tool name '{tool.name}' ({len(tool.name)} chars) "
                 f"-> '{short}' to fit Kiro's {KIRO_TOOL_NAME_MAX_LENGTH}-char limit"
             )
