@@ -341,6 +341,11 @@ def convert_anthropic_tools(
     """
     Converts Anthropic tools to unified format.
 
+    Server-side tools (those with a `type` field like web_search_20250305) are
+    intercepted by the routes layer before this function is ever called (Path A),
+    or auto-injected as regular tools (Path B). This function only sees
+    user-defined tools with a proper input_schema.
+
     Args:
         tools: List of Anthropic tools
 
@@ -363,7 +368,7 @@ def convert_anthropic_tools(
             input_schema = tool.input_schema
 
         unified_tools.append(
-            UnifiedTool(name=name, description=description, input_schema=input_schema)
+            UnifiedTool(name=name, description=description, input_schema=input_schema or {})
         )
 
     return unified_tools if unified_tools else None
@@ -401,7 +406,6 @@ def anthropic_to_kiro(
     # Convert messages to unified format
     unified_messages = convert_anthropic_messages(request.messages)
 
-    # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!

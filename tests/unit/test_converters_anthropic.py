@@ -1434,6 +1434,60 @@ class TestConvertAnthropicTools:
         assert result is not None
         assert result[0].description is None
 
+    def test_passes_through_tool_with_both_name_and_type(self):
+        """
+        What it does: Verifies that a tool carrying both name and type (e.g. the
+            auto-injected web_search from Path B) is converted normally.
+        Purpose: Server-side tools are intercepted in the routes layer (Path A)
+            before the converter runs. The converter itself no longer drops tools;
+            it converts whatever it receives.
+        """
+        print("Setup: Tool list with a named+typed tool and a regular tool...")
+        tools = [
+            AnthropicTool(name="web_search", type="web_search_20250305"),
+            AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 2
+        names = {t.name for t in result}
+        assert "web_search" in names
+        assert "get_weather" in names
+
+    def test_converts_dict_tools_including_typed(self):
+        """
+        What it does: Verifies dict-shaped tools with a type field convert normally.
+        Purpose: The converter accepts both Pydantic models and dicts; typed tools
+            (from Path B auto-injection) must convert cleanly in both shapes.
+        """
+        print("Setup: Dict-shaped tool list with a typed tool...")
+        tools = [
+            {"name": "web_search", "type": "web_search_20250305", "input_schema": {"type": "object"}},
+            {"name": "get_weather", "input_schema": {"type": "object"}},
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 2
+
+    def test_returns_none_when_tool_list_is_empty_after_conversion(self):
+        """
+        What it does: Verifies that an empty tool list yields None.
+        Purpose: Downstream code expects None to mean "no tools".
+        """
+        print("Setup: Empty tool list...")
+        result = convert_anthropic_tools([])
+
+        print(f"Result: {result}")
+        assert result is None
+
 
 # ==================================================================================================
 # Tests for anthropic_to_kiro

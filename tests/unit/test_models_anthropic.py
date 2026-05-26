@@ -1029,19 +1029,35 @@ class TestAnthropicTool:
         print(f"ValidationError raised: {exc_info.value}")
         assert "name" in str(exc_info.value)
     
-    def test_requires_input_schema(self):
+    def test_input_schema_is_optional_for_server_tools(self):
         """
-        What it does: Verifies that input_schema is required.
-        Purpose: Ensure validation fails without input_schema.
+        What it does: Verifies that input_schema is optional, allowing Anthropic
+            server tools (e.g. web_search_20250305) which omit it.
+        Purpose: Claude Code and other clients send server tools without
+            input_schema; the gateway must not 422 them at validation.
         """
-        print("Setup: Attempting to create AnthropicTool without input_schema...")
-        
-        print("Action: Creating model (should raise ValidationError)...")
-        with pytest.raises(ValidationError) as exc_info:
-            AnthropicTool(name="test")
-        
-        print(f"ValidationError raised: {exc_info.value}")
-        assert "input_schema" in str(exc_info.value)
+        print("Setup: Creating AnthropicTool as a server tool (no input_schema)...")
+        tool = AnthropicTool(name="web_search", type="web_search_20250305")
+
+        print(f"Comparing input_schema: Expected None, Got {tool.input_schema}")
+        assert tool.input_schema is None
+        assert tool.type == "web_search_20250305"
+
+    def test_allows_extra_fields_for_server_tools(self):
+        """
+        What it does: Verifies that extra fields like max_uses are accepted.
+        Purpose: Server tools carry tool-specific config (max_uses for web_search,
+            etc.) that must not trigger validation errors.
+        """
+        print("Setup: Creating server tool with max_uses extra field...")
+        tool = AnthropicTool(
+            name="web_search",
+            type="web_search_20250305",
+            max_uses=8,
+        )
+
+        assert tool.name == "web_search"
+        assert tool.type == "web_search_20250305"
     
     def test_description_is_optional(self):
         """

@@ -309,15 +309,46 @@ class AnthropicTool(BaseModel):
     """
     Tool definition in Anthropic format.
 
+    Supports both user-defined tools (with input_schema) and Anthropic server tools
+    (e.g. web_search_20250305). Server tools carry a `type` field and may omit
+    both `name` and `input_schema`, plus carry extra fields like `max_uses`.
+
     Attributes:
-        name: Tool name (must match pattern ^[a-zA-Z0-9_-]{1,64}$)
-        description: Tool description (optional but recommended)
-        input_schema: JSON Schema for tool parameters
+        type: Server tool variant identifier (e.g. "web_search_20250305")
+        name: Tool name — required for user-defined tools, optional for server tools
+        description: Tool description (optional)
+        input_schema: JSON Schema for parameters — required for user-defined tools
+        max_uses: Max uses per conversation (server tools only)
+        allowed_domains: Allowed domains for web_search (optional)
+        blocked_domains: Blocked domains for web_search (optional)
+        user_location: User location hint for web_search (optional)
     """
 
-    name: str
+    type: Optional[str] = None
+    name: Optional[str] = None
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    input_schema: Optional[Dict[str, Any]] = None
+
+    # Server-tool-specific fields (accepted but not forwarded to Kiro)
+    max_uses: Optional[int] = None
+    allowed_domains: Optional[List[str]] = None
+    blocked_domains: Optional[List[str]] = None
+
+    model_config = {"extra": "allow"}
+
+    @model_validator(mode="after")
+    def validate_tool_consistency(self) -> "AnthropicTool":
+        """User-defined tools (no type field) must have both name and input_schema."""
+        if self.type is None:
+            if not self.name:
+                raise ValueError(
+                    "name is required for user-defined tools (those without a 'type' field)"
+                )
+            if self.input_schema is None:
+                raise ValueError(
+                    "input_schema is required for user-defined tools (those without a 'type' field)"
+                )
+        return self
 
 
 class ToolChoiceAuto(BaseModel):

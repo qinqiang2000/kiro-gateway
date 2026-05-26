@@ -528,6 +528,18 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
 
 
 # ==================================================================================================
+# WebSearch Settings (MCP Tool Emulation)
+# ==================================================================================================
+
+# Enable web_search tool auto-injection (default: true)
+# When enabled, web_search is automatically added as a tool for MCP emulation (Path B)
+# Model decides whether to use it or not
+#
+# Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
+WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+# ==================================================================================================
 # Credential Reload Settings
 # ==================================================================================================
 
