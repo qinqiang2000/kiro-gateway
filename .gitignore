@@ -39,3 +39,4 @@ systemd/kiro-gateway.service
 
 # Claude Code local settings (per-machine, not committed)
 .claude/settings.local.json
+.claude/worktrees/
