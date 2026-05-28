@@ -64,16 +64,19 @@ except ImportError:
 class KiroEvent:
     """
     Unified event from Kiro API stream.
-    
+
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
-    
+
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool_use, usage, context_usage,
+              reasoning_signature, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
+        reasoning_signature: Native reasoning signature emitted at end of
+            Kiro's reasoning stream (used by Anthropic thinking block).
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
     """
@@ -83,6 +86,7 @@ class KiroEvent:
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    reasoning_signature: Optional[str] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
 
@@ -275,9 +279,23 @@ async def _process_chunk(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "reasoning":
+            # Native reasoning text from Kiro. Bypass the FAKE_REASONING
+            # tag-injection parser entirely — these chunks are already
+            # cleanly separated from regular content by the upstream API.
+            text = event["data"]
+            if text:
+                yield KiroEvent(type="thinking", thinking_content=text)
+
+        elif event["type"] == "reasoning_signature":
+            # End-of-reasoning marker carrying Kiro's signature. Forward as
+            # a dedicated KiroEvent so the Anthropic formatter can attach
+            # the real signature to its thinking block.
+            yield KiroEvent(type="reasoning_signature", reasoning_signature=event["data"])
+
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
-        
+
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 

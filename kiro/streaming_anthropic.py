@@ -149,8 +149,12 @@ async def stream_kiro_to_anthropic(
     tool_blocks: List[Dict[str, Any]] = []
     tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
     
-    # Generate signature for thinking block (used if thinking is present)
+    # Generate placeholder signature for thinking block. If Kiro emits a
+    # native reasoning signature mid-stream, we'll override this via a
+    # signature_delta before closing the thinking block.
     thinking_signature = generate_thinking_signature()
+    real_reasoning_signature: Optional[str] = None
+    thinking_signature_emitted = False
     
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
@@ -178,19 +182,37 @@ async def stream_kiro_to_anthropic(
         })
         
         async for event in parse_kiro_stream(response, first_token_timeout):
+            if event.type == "reasoning_signature":
+                # Native reasoning signature from Kiro arrives between the
+                # last reasoning text chunk and the first content/tool event.
+                # Stash it; we'll emit it as a signature_delta when the
+                # thinking block is closed.
+                real_reasoning_signature = event.reasoning_signature
+                continue
+
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
                 
                 # Close thinking block if it was open and we're now getting regular content
                 if thinking_block_started and thinking_block_index is not None:
+                    if real_reasoning_signature and not thinking_signature_emitted:
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": thinking_block_index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": real_reasoning_signature,
+                            },
+                        })
+                        thinking_signature_emitted = True
                     yield format_sse_event("content_block_stop", {
                         "type": "content_block_stop",
                         "index": thinking_block_index
                     })
                     thinking_block_started = False
                     current_block_index += 1
-                
+
                 # Start text block if not started
                 if not text_block_started:
                     text_block_index = current_block_index
@@ -249,6 +271,16 @@ async def stream_kiro_to_anthropic(
                     # Include thinking as regular text content
                     # Close thinking block if it was open (shouldn't happen in this mode)
                     if thinking_block_started and thinking_block_index is not None:
+                        if real_reasoning_signature and not thinking_signature_emitted:
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": thinking_block_index,
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": real_reasoning_signature,
+                                },
+                            })
+                            thinking_signature_emitted = True
                         yield format_sse_event("content_block_stop", {
                             "type": "content_block_stop",
                             "index": thinking_block_index
@@ -283,6 +315,16 @@ async def stream_kiro_to_anthropic(
             elif event.type == "tool_use" and event.tool_use:
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
+                    if real_reasoning_signature and not thinking_signature_emitted:
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": thinking_block_index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": real_reasoning_signature,
+                            },
+                        })
+                        thinking_signature_emitted = True
                     yield format_sse_event("content_block_stop", {
                         "type": "content_block_stop",
                         "index": thinking_block_index
@@ -466,6 +508,16 @@ async def stream_kiro_to_anthropic(
         if bracket_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
+                if real_reasoning_signature and not thinking_signature_emitted:
+                    yield format_sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": thinking_block_index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": real_reasoning_signature,
+                        },
+                    })
+                    thinking_signature_emitted = True
                 yield format_sse_event("content_block_stop", {
                     "type": "content_block_stop",
                     "index": thinking_block_index
@@ -531,6 +583,16 @@ async def stream_kiro_to_anthropic(
         
         # Close thinking block if still open
         if thinking_block_started and thinking_block_index is not None:
+            if real_reasoning_signature and not thinking_signature_emitted:
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": thinking_block_index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": real_reasoning_signature,
+                    },
+                })
+                thinking_signature_emitted = True
             yield format_sse_event("content_block_stop", {
                 "type": "content_block_stop",
                 "index": thinking_block_index

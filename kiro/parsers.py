@@ -217,6 +217,8 @@ class AwsEventStreamParser:
     
     Supported event types:
     - content: Text content of response
+    - reasoning_text: Native reasoning/thinking text from Kiro
+    - reasoning_signature: End-of-reasoning marker (no output emitted)
     - tool_start: Start of tool call (name, toolUseId)
     - tool_input: Continuation of input for tool call
     - tool_stop: End of tool call
@@ -246,6 +248,8 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        ('{"text":', 'reasoning_text'),
+        ('{"signature":', 'reasoning_signature'),
     ]
     
     def __init__(self):
@@ -318,6 +322,16 @@ class AwsEventStreamParser:
         """
         if event_type == 'content':
             return self._process_content_event(data)
+        elif event_type == 'reasoning_text':
+            return self._process_reasoning_text_event(data)
+        elif event_type == 'reasoning_signature':
+            # End-of-reasoning marker. We forward the signature so the
+            # downstream Anthropic formatter can attach it to the thinking
+            # block (Anthropic uses it for tamper verification).
+            sig = data.get('signature', '')
+            if sig:
+                return {"type": "reasoning_signature", "data": sig}
+            return None
         elif event_type == 'tool_start':
             return self._process_tool_start_event(data)
         elif event_type == 'tool_input':
@@ -328,8 +342,22 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
-        
+
         return None
+
+    def _process_reasoning_text_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes a native reasoning text event from Kiro.
+
+        Kiro emits ``reasoningContentEvent`` frames with ``{"text": "..."}``
+        payloads to stream the model's chain-of-thought. We surface these as
+        a separate ``reasoning`` event so the streaming layer can map them
+        onto Anthropic ``thinking`` content blocks.
+        """
+        text = data.get('text', '')
+        if not text:
+            return None
+        return {"type": "reasoning", "data": text}
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
