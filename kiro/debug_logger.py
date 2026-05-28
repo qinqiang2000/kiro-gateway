@@ -32,14 +32,29 @@ Also captures application logs (loguru) for each request and saves
 them to app_logs.txt file for debugging convenience.
 """
 
+import contextvars
 import io
 import json
 import shutil
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from loguru import logger
 
 from kiro.config import DEBUG_MODE, DEBUG_DIR
+
+
+# Per-request debug directory, scoped via ContextVar so concurrent requests
+# don't overwrite each other's debug artifacts. Each request gets its own
+# subdirectory under DEBUG_DIR (e.g. debug_logs/req_HHMMSS_xxxxxx/).
+_request_dir_var: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "debug_request_dir", default=None
+)
+
+# Keep at most this many per-request directories under DEBUG_DIR.
+# Older directories are pruned by mtime when a new request is prepared.
+MAX_REQUEST_DIRS = 50
 
 
 class DebugLogger:
@@ -78,10 +93,40 @@ class DebugLogger:
     def _is_enabled(self) -> bool:
         """Checks if logging is enabled."""
         return DEBUG_MODE in ("errors", "all")
-    
+
     def _is_immediate_write(self) -> bool:
         """Checks if immediate file writing is needed (all mode)."""
         return DEBUG_MODE == "all"
+
+    def _current_dir(self) -> Path:
+        """
+        Returns the per-request debug directory for the current request.
+
+        Falls back to ``self.debug_dir`` when no request has been prepared
+        (e.g. background tasks that aren't tied to an HTTP request).
+        """
+        d = _request_dir_var.get()
+        return d if d is not None else self.debug_dir
+
+    def _prune_old_request_dirs(self) -> None:
+        """Keep only the most recent MAX_REQUEST_DIRS request subdirectories."""
+        try:
+            if not self.debug_dir.exists():
+                return
+            req_dirs = [
+                p for p in self.debug_dir.iterdir()
+                if p.is_dir() and p.name.startswith("req_")
+            ]
+            if len(req_dirs) <= MAX_REQUEST_DIRS:
+                return
+            req_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for stale in req_dirs[MAX_REQUEST_DIRS:]:
+                try:
+                    shutil.rmtree(stale)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[DebugLogger] Prune skipped: {e}")
     
     def _clear_buffers(self):
         """Clears all buffers."""
@@ -129,29 +174,30 @@ class DebugLogger:
     def prepare_new_request(self):
         """
         Prepares the logger for a new request.
-        
-        In "all" mode: clears the logs folder.
-        In "errors" mode: clears buffers.
-        In both modes: sets up application log capture.
+
+        Creates a per-request subdirectory under DEBUG_DIR and binds it to the
+        current request's ContextVar so concurrent requests don't overwrite
+        each other's artifacts.
         """
         if not self._is_enabled():
             return
-        
+
         # Clear buffers in any case
         self._clear_buffers()
-        
+
         # Set up application log capture
         self._setup_app_logs_capture()
 
-        if self._is_immediate_write():
-            # "all" mode - clear folder and recreate
-            try:
-                if self.debug_dir.exists():
-                    shutil.rmtree(self.debug_dir)
-                self.debug_dir.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"[DebugLogger] Directory {self.debug_dir} cleared for new request.")
-            except Exception as e:
-                logger.error(f"[DebugLogger] Error preparing directory: {e}")
+        try:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            req_id = f"req_{time.strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            req_dir = self.debug_dir / req_id
+            req_dir.mkdir(parents=True, exist_ok=True)
+            _request_dir_var.set(req_dir)
+            self._prune_old_request_dirs()
+            logger.debug(f"[DebugLogger] New request dir: {req_dir}")
+        except Exception as e:
+            logger.error(f"[DebugLogger] Error preparing request dir: {e}")
 
     def log_request_body(self, body: bytes):
         """
@@ -234,16 +280,17 @@ class DebugLogger:
         
         try:
             # Ensure directory exists
-            self.debug_dir.mkdir(parents=True, exist_ok=True)
-            
+            req_dir = self._current_dir()
+            req_dir.mkdir(parents=True, exist_ok=True)
+
             error_info = {
                 "status_code": status_code,
                 "error_message": error_message
             }
-            error_file = self.debug_dir / "error_info.json"
+            error_file = req_dir / "error_info.json"
             with open(error_file, "w", encoding="utf-8") as f:
                 json.dump(error_info, f, indent=2, ensure_ascii=False)
-            
+
             logger.debug(f"[DebugLogger] Error info saved (status={status_code})")
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing error_info: {e}")
@@ -279,35 +326,34 @@ class DebugLogger:
             return
         
         try:
-            # Create directory if not exists
-            if self.debug_dir.exists():
-                shutil.rmtree(self.debug_dir)
-            self.debug_dir.mkdir(parents=True, exist_ok=True)
-            
+            # Ensure per-request directory exists
+            req_dir = self._current_dir()
+            req_dir.mkdir(parents=True, exist_ok=True)
+
             # Flush buffers to files
             if self._request_body_buffer:
                 self._write_request_body_to_file(self._request_body_buffer)
-            
+
             if self._kiro_request_body_buffer:
                 self._write_kiro_request_body_to_file(self._kiro_request_body_buffer)
-            
+
             if self._raw_chunks_buffer:
-                file_path = self.debug_dir / "response_stream_raw.txt"
+                file_path = req_dir / "response_stream_raw.txt"
                 with open(file_path, "wb") as f:
                     f.write(self._raw_chunks_buffer)
-            
+
             if self._modified_chunks_buffer:
-                file_path = self.debug_dir / "response_stream_modified.txt"
+                file_path = req_dir / "response_stream_modified.txt"
                 with open(file_path, "wb") as f:
                     f.write(self._modified_chunks_buffer)
-            
+
             # Save error information
             self.log_error_info(status_code, error_message)
-            
+
             # Save application logs
             self._write_app_logs_to_file()
-            
-            logger.info(f"[DebugLogger] Error logs flushed to {self.debug_dir} (status={status_code})")
+
+            logger.info(f"[DebugLogger] Error logs flushed to {req_dir} (status={status_code})")
             
         except Exception as e:
             logger.error(f"[DebugLogger] Error flushing buffers: {e}")
@@ -334,7 +380,7 @@ class DebugLogger:
     def _write_request_body_to_file(self, body: bytes):
         """Writes request body to file."""
         try:
-            file_path = self.debug_dir / "request_body.json"
+            file_path = self._current_dir() / "request_body.json"
             try:
                 json_obj = json.loads(body)
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -344,11 +390,11 @@ class DebugLogger:
                     f.write(body)
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing request_body: {e}")
-    
+
     def _write_kiro_request_body_to_file(self, body: bytes):
         """Writes Kiro request body to file."""
         try:
-            file_path = self.debug_dir / "kiro_request_body.json"
+            file_path = self._current_dir() / "kiro_request_body.json"
             try:
                 json_obj = json.loads(body)
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -358,41 +404,42 @@ class DebugLogger:
                     f.write(body)
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing kiro_request_body: {e}")
-    
+
     def _append_raw_chunk_to_file(self, chunk: bytes):
         """Appends raw chunk to file."""
         try:
-            file_path = self.debug_dir / "response_stream_raw.txt"
+            file_path = self._current_dir() / "response_stream_raw.txt"
             with open(file_path, "ab") as f:
                 f.write(chunk)
         except Exception:
             pass
-    
+
     def _append_modified_chunk_to_file(self, chunk: bytes):
         """Appends modified chunk to file."""
         try:
-            file_path = self.debug_dir / "response_stream_modified.txt"
+            file_path = self._current_dir() / "response_stream_modified.txt"
             with open(file_path, "ab") as f:
                 f.write(chunk)
         except Exception:
             pass
-    
+
     def _write_app_logs_to_file(self):
         """Writes captured application logs to file."""
         try:
             # Get buffer contents
             logs_content = self._app_logs_buffer.getvalue()
-            
+
             if not logs_content.strip():
                 return
-            
+
             # Ensure directory exists
-            self.debug_dir.mkdir(parents=True, exist_ok=True)
-            
-            file_path = self.debug_dir / "app_logs.txt"
+            req_dir = self._current_dir()
+            req_dir.mkdir(parents=True, exist_ok=True)
+
+            file_path = req_dir / "app_logs.txt"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(logs_content)
-            
+
             logger.debug(f"[DebugLogger] App logs saved to {file_path}")
         except Exception as e:
             # Don't log error via logger to avoid recursion
