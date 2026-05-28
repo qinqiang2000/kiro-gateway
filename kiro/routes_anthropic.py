@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, WEB_SEARCH_ENABLED
+from kiro.config import PROXY_API_KEY, WEB_SEARCH_ENABLED, ALLOW_ANY_ANTHROPIC_KEY
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -50,7 +50,7 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.tokenizer import count_tools_tokens
+from kiro.tokenizer import count_tools_tokens, count_tokens, count_message_tokens
 
 # Import debug_logger
 try:
@@ -72,18 +72,24 @@ async def verify_anthropic_api_key(
 ) -> bool:
     """
     Verify API key for Anthropic API.
-    
+
     Supports two authentication methods:
     1. x-api-key header (Anthropic native)
     2. Authorization: Bearer header (for compatibility)
-    
+
+    When ALLOW_ANY_ANTHROPIC_KEY is enabled (default), any non-empty key is
+    accepted. This lets clients like Claude Code Desktop work even when they
+    send their own OAuth token (sk-ant-oat...) instead of the proxy key.
+    The client key is consumed at the gateway boundary — it is never
+    forwarded to Kiro.
+
     Args:
         x_api_key: Value from x-api-key header
         authorization: Value from Authorization header
-    
+
     Returns:
         True if key is valid
-    
+
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
@@ -94,6 +100,14 @@ async def verify_anthropic_api_key(
     # Fall back to Authorization: Bearer
     if authorization and authorization == f"Bearer {PROXY_API_KEY}":
         return True
+
+    # Permissive mode: accept any non-empty key (local proxy convenience)
+    if ALLOW_ANY_ANTHROPIC_KEY:
+        bearer_token = None
+        if authorization and authorization.startswith("Bearer "):
+            bearer_token = authorization[len("Bearer "):].strip()
+        if (x_api_key and x_api_key.strip()) or (bearer_token):
+            return True
 
     def _redact(value: Optional[str], keep: int = 4) -> str:
         if not value:
@@ -496,3 +510,56 @@ async def messages(
                 }
             }
         )
+
+
+# ==================================================================================================
+# /v1/messages/count_tokens — local token estimation
+# ==================================================================================================
+#
+# Anthropic spec: https://docs.anthropic.com/en/api/messages-count-tokens
+# Request body mirrors /v1/messages (without max_tokens / stream).
+# Response: {"input_tokens": <int>}.
+#
+# Kiro has no equivalent endpoint, so we estimate locally with tiktoken
+# (same approach used elsewhere in the gateway). Approximate but stable.
+
+class _CountTokensRequest(AnthropicMessagesRequest):
+    """count_tokens uses the same shape as /v1/messages but max_tokens is optional."""
+    max_tokens: Optional[int] = None
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
+async def count_tokens_endpoint(request_data: _CountTokensRequest):
+    """
+    Estimate input token count for an Anthropic Messages-style request.
+
+    Returns:
+        JSON: {"input_tokens": int}
+    """
+    # Reuse the same dump shape as the streaming path uses for tokenization.
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = (
+        [tool.model_dump() for tool in request_data.tools]
+        if request_data.tools else None
+    )
+
+    # System prompt may be a string or a list of content blocks.
+    system_text = ""
+    if request_data.system:
+        if isinstance(request_data.system, str):
+            system_text = request_data.system
+        elif isinstance(request_data.system, list):
+            parts = []
+            for block in request_data.system:
+                if isinstance(block, dict):
+                    parts.append(block.get("text", ""))
+                else:
+                    parts.append(getattr(block, "text", "") or "")
+            system_text = "\n".join(p for p in parts if p)
+
+    total = count_message_tokens(messages_for_tokenizer)
+    total += count_tools_tokens(tools_for_tokenizer)
+    if system_text:
+        total += count_tokens(system_text)
+
+    return JSONResponse(content={"input_tokens": int(total)})

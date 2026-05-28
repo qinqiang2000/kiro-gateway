@@ -100,6 +100,15 @@ SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
 # API key for proxy access (clients must pass it in Authorization header)
 PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 
+# When enabled, the Anthropic endpoint accepts any non-empty x-api-key or
+# Authorization: Bearer header. Useful for clients (e.g., Claude Code Desktop)
+# that send their own OAuth token (sk-ant-oat...) and ignore overrides.
+# The client key is only used for proxy gating; it is never forwarded to Kiro.
+# Default: true (local-first proxy, low risk).
+ALLOW_ANY_ANTHROPIC_KEY: bool = os.getenv(
+    "ALLOW_ANY_ANTHROPIC_KEY", "true"
+).lower() in ("true", "1", "yes", "on")
+
 # ==================================================================================================
 # VPN/Proxy Settings for Kiro API Access
 # ==================================================================================================
