@@ -173,20 +173,52 @@ async def parse_kiro_stream(
         # Process first chunk
         if debug_logger:
             debug_logger.log_raw_chunk(first_byte_chunk)
-        
+
         async for event in _process_chunk(parser, first_byte_chunk, thinking_parser):
             if event.type == "content" or event.type == "thinking":
                 first_token_received = True
             yield event
-        
-        # Continue reading remaining chunks
-        async for chunk in byte_iterator:
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
-            
-            async for event in _process_chunk(parser, chunk, thinking_parser):
-                yield event
-        
+
+        # Continue reading remaining chunks.
+        #
+        # Kiro intermittently drops the TCP connection mid-stream during
+        # chunked transfer (upstream issue #129), surfacing as
+        # httpx.RemoteProtocolError. When this happens AFTER the model has
+        # already produced output (content/thinking/tool calls), we must not
+        # discard that work — we break out and fall through to finalization
+        # so accumulated tool calls and thinking are still flushed and the
+        # caller can close the stream cleanly. Only a drop before any output
+        # is treated as a hard failure and re-raised (so retry/error logic
+        # upstream can react).
+        stream_interrupted = False
+        try:
+            async for chunk in byte_iterator:
+                if debug_logger:
+                    debug_logger.log_raw_chunk(chunk)
+
+                async for event in _process_chunk(parser, chunk, thinking_parser):
+                    if event.type == "content" or event.type == "thinking":
+                        first_token_received = True
+                    yield event
+        except httpx.RemoteProtocolError as e:
+            has_partial_output = (
+                first_token_received
+                or bool(parser.tool_calls)
+                or parser.current_tool_call is not None
+            )
+            if not has_partial_output:
+                # Nothing usable arrived — treat as a genuine failure.
+                logger.warning(
+                    f"[StreamInterrupted] Connection dropped before any output: {e}"
+                )
+                raise
+            stream_interrupted = True
+            logger.warning(
+                f"[StreamInterrupted] Kiro closed connection mid-stream after partial "
+                f"output (upstream issue #129). Salvaging accumulated content/tool calls. "
+                f"Detail: {e}"
+            )
+
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
             final_result = thinking_parser.finalize()
@@ -218,7 +250,13 @@ async def parse_kiro_stream(
         # Yield tool calls if any
         for tc in all_tool_calls:
             yield KiroEvent(type="tool_use", tool_use=tc)
-            
+
+        if stream_interrupted:
+            logger.info(
+                f"[StreamInterrupted] Salvaged {len(all_tool_calls)} tool call(s) "
+                f"after mid-stream disconnect; stream closed normally."
+            )
+
     except FirstTokenTimeoutError:
         raise
     except GeneratorExit:

@@ -15,6 +15,7 @@ Tests for:
 
 import pytest
 import asyncio
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
@@ -466,6 +467,72 @@ class TestParseKiroStream:
         assert "30" in str(exc_info.value)
         print("✓ FirstTokenTimeoutError raised on timeout")
     
+    @pytest.mark.asyncio
+    async def test_salvages_tool_calls_on_midstream_disconnect(self, mock_response, mock_parser):
+        """
+        What it does: When Kiro drops the connection mid-stream AFTER producing
+            output, accumulated tool calls are still yielded (upstream issue #129).
+        Goal: Verify RemoteProtocolError after partial output is salvaged, not raised.
+        """
+        print("Setup: Parser with a tool call, stream that drops mid-way...")
+        salvaged_tool = {
+            "id": "tooluse_abc",
+            "type": "function",
+            "function": {"name": "Agent", "arguments": '{"subagent_type": "Explore"}'},
+        }
+        mock_parser.feed.return_value = [{"type": "content", "data": "thinking..."}]
+        mock_parser.tool_calls = [salvaged_tool]
+        mock_parser.current_tool_call = None
+        mock_parser.get_tool_calls.return_value = [salvaged_tool]
+
+        async def mock_aiter_bytes():
+            yield b'first'
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing interrupted stream...")
+        events = []
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                    events.append(event)
+
+        tool_events = [e for e in events if e.type == "tool_use"]
+        print(f"Received {len(events)} events, {len(tool_events)} tool_use")
+        assert len(tool_events) == 1
+        assert tool_events[0].tool_use["function"]["name"] == "Agent"
+        print("✓ Tool call salvaged after mid-stream disconnect")
+
+    @pytest.mark.asyncio
+    async def test_reraises_disconnect_before_any_output(self, mock_response, mock_parser):
+        """
+        What it does: A mid-stream disconnect with NO prior output is re-raised.
+        Goal: Verify genuine early failures still propagate (not silently swallowed).
+        """
+        print("Setup: Parser with no output, stream drops on first chunk...")
+        mock_parser.feed.return_value = []  # no content/thinking
+        mock_parser.tool_calls = []
+        mock_parser.current_tool_call = None
+        mock_parser.get_tool_calls.return_value = []
+
+        async def mock_aiter_bytes():
+            yield b'first-empty'
+            raise httpx.RemoteProtocolError("peer closed connection (incomplete chunked read)")
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing stream that drops before any output...")
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                with pytest.raises(httpx.RemoteProtocolError):
+                    async for _event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        pass
+        print("✓ Early disconnect re-raised")
+
     @pytest.mark.asyncio
     async def test_handles_empty_response(self, mock_response):
         """
