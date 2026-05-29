@@ -403,14 +403,28 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
+    # Extract system-role messages injected inline (e.g. Claude Code Opus 4.8
+    # puts <system-reminder> blocks as role="system" inside the messages array
+    # instead of the top-level system field).
+    inline_system_parts = []
+    non_system_messages = []
+    for msg in request.messages:
+        if msg.role == "system":
+            inline_system_parts.append(extract_text_content(msg.content))
+        else:
+            non_system_messages.append(msg)
+
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    unified_messages = convert_anthropic_messages(non_system_messages)
 
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+    if inline_system_parts:
+        inline_system = "\n".join(inline_system_parts).strip()
+        system_prompt = (system_prompt + "\n\n" + inline_system).strip() if system_prompt else inline_system
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
