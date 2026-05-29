@@ -342,21 +342,37 @@ def get_truncation_recovery_system_addition() -> str:
     )
 
 
-def inject_thinking_tags(content: str) -> str:
+def inject_thinking_tags(content: str, model_id: str = "") -> str:
     """
     Inject fake reasoning tags into content.
-    
+
     When FAKE_REASONING_ENABLED is True, this function prepends the special
     thinking mode tags to the content. These tags instruct the model to
     include its reasoning process in the response.
-    
+
+    Skipped for models that have a native reasoning channel (claude-opus-4.7+),
+    because those models ignore the tags and instead emit all output through
+    the reasoning channel only — producing zero content/tool output (issue #178).
+
     Args:
         content: Original content string
-    
+        model_id: Kiro model ID (used to skip injection for native-reasoning models)
+
     Returns:
         Content with thinking tags prepended (if enabled) or original content
     """
     if not FAKE_REASONING_ENABLED:
+        return content
+
+    # Models with native reasoning channels don't respond to fake reasoning tags.
+    # They emit output exclusively through reasoningContentEvent, producing no
+    # content/tool output when the tags are present (upstream issue #178).
+    NATIVE_REASONING_MODELS = (
+        "claude-opus-4.7",
+        "claude-opus-4.8",
+    )
+    if any(model_id.startswith(m) or model_id == m for m in NATIVE_REASONING_MODELS):
+        logger.debug(f"Skipping fake reasoning injection for native-reasoning model: {model_id}")
         return content
     
     # Thinking instruction to improve reasoning quality
@@ -1596,7 +1612,7 @@ def build_kiro_payload(
     
     # Inject thinking tags if enabled (only for the current/last user message)
     if inject_thinking and current_message.role == "user":
-        current_content = inject_thinking_tags(current_content)
+        current_content = inject_thinking_tags(current_content, model_id)
     
     # Build userInputMessage
     user_input_message = {
