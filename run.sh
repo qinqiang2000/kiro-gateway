@@ -51,27 +51,46 @@ get_port() {
     echo "$port"
 }
 
-port_holder_pid() {
-    local pid
-    pid=$(lsof -tiTCP:"$1" -sTCP:LISTEN -n -P 2>/dev/null) || true
-    echo "${pid%%$'\n'*}"
+# Prints every PID listening on the given port, space-separated (may be empty).
+port_holder_pids() {
+    lsof -tiTCP:"$1" -sTCP:LISTEN -n -P 2>/dev/null | tr '\n' ' ' || true
 }
 
+# Frees the port by terminating ALL listeners on it, then waits until the
+# listening socket is actually released — not merely until the process dies.
+# The distinction matters: a dead process can leave the socket briefly bound,
+# and starting the new server in that gap causes "address already in use".
 free_port() {
     local port="$1"
-    local pid
-    pid=$(port_holder_pid "$port")
-    [ -z "$pid" ] && return 0
-    echo "Port $port still held by PID $pid (orphan). Terminating..."
-    kill -TERM "$pid" 2>/dev/null || true
+    local pids
+    pids=$(port_holder_pids "$port")
+    [ -z "$pids" ] && return 0
+    echo "Port $port still held by PID(s):$pids (orphan). Terminating..."
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+
+    # Wait for the port itself to clear (re-checking holders each round).
     local wait_time=0
-    while kill -0 "$pid" 2>/dev/null && [ $wait_time -lt 5 ]; do
+    while [ -n "$(port_holder_pids "$port")" ] && [ $wait_time -lt 6 ]; do
         sleep 1
         wait_time=$((wait_time + 1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "  did not exit, sending SIGKILL"
-        kill -KILL "$pid" 2>/dev/null || true
+
+    # Still held? Escalate to SIGKILL on whoever is left, then wait again.
+    pids=$(port_holder_pids "$port")
+    if [ -n "$pids" ]; then
+        echo "  did not exit, sending SIGKILL to:$pids"
+        # shellcheck disable=SC2086
+        kill -KILL $pids 2>/dev/null || true
+        wait_time=0
+        while [ -n "$(port_holder_pids "$port")" ] && [ $wait_time -lt 5 ]; do
+            sleep 1
+            wait_time=$((wait_time + 1))
+        done
+    fi
+
+    if [ -n "$(port_holder_pids "$port")" ]; then
+        echo "  WARNING: port $port is still held; start will likely fail"
     fi
 }
 
@@ -97,6 +116,23 @@ cmd_start() {
     disown
     set +m
     echo "$pid" > "$PID_FILE"
+
+    # Confirm the process survived startup (e.g. didn't die on "address already
+    # in use"). Without this, a bind failure leaves a stale PID file pointing at
+    # a corpse while status/stop report "not running".
+    local check=0
+    while [ $check -lt 3 ]; do
+        sleep 1
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            echo "Kiro Gateway failed to start (process $pid exited). Last log lines:"
+            echo ""
+            tail -n 15 "$LOG_FILE"
+            exit 1
+        fi
+        check=$((check + 1))
+    done
+
     echo "Kiro Gateway started (PID: $pid)"
     echo "Log: $LOG_FILE"
     echo ""
