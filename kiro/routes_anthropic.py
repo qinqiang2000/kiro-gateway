@@ -41,7 +41,7 @@ from kiro.models_anthropic import (
     AnthropicErrorResponse,
     AnthropicErrorDetail,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
@@ -309,10 +309,9 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is only needed for Kiro Desktop auth
-    profile_arn_for_payload = ""
-    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-        profile_arn_for_payload = auth_manager.profile_arn
+    # profileArn: AWS started enforcing it for IdC/Enterprise auth
+    # (2026-08-25), so send it whenever the auth manager resolved one.
+    profile_arn_for_payload = auth_manager.profile_arn or ""
     
     try:
         kiro_payload, tool_name_map = anthropic_to_kiro(

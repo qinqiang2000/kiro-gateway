@@ -43,7 +43,7 @@ from kiro.models_openai import (
     ModelList,
     ChatCompletionRequest,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
@@ -233,11 +233,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is only needed for Kiro Desktop auth
-    # AWS SSO OIDC (Builder ID) users don't need profileArn and it causes 403 if sent
-    profile_arn_for_payload = ""
-    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-        profile_arn_for_payload = auth_manager.profile_arn
+    # profileArn: AWS started enforcing it for IdC/Enterprise auth
+    # (2026-08-25), so send it whenever the auth manager resolved one.
+    profile_arn_for_payload = auth_manager.profile_arn or ""
     
     try:
         kiro_payload, tool_name_map = build_kiro_payload(
