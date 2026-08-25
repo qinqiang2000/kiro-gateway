@@ -127,6 +127,9 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    # True once any chunk reached the client. On error the stream then has to be
+    # closed with a finish_reason chunk instead of just stopping mid-completion.
+    sent_any = False
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -155,6 +158,7 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                sent_any = True
                 yield chunk_text
             
             elif event.type == "thinking" and event.thinking_content:
@@ -184,6 +188,7 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                sent_any = True
                 yield chunk_text
             
             elif event.type == "tool_use" and event.tool_use:
@@ -292,6 +297,7 @@ async def stream_kiro_to_openai_internal(
                     "finish_reason": None
                 }]
             }
+            sent_any = True
             yield f"data: {json.dumps(tool_calls_chunk, ensure_ascii=False)}\n\n"
         
         # Save truncation info for recovery (tracked by stable identifiers)
@@ -364,6 +370,22 @@ async def stream_kiro_to_openai_internal(
             f"Error during streaming: [{error_type}] {error_msg}",
             exc_info=True
         )
+        # The client is mid-completion: it has deltas that all carry
+        # finish_reason=None and would otherwise only ever see [DONE], leaving
+        # the choice unterminated. Close it with a finish_reason chunk first.
+        # Usage is omitted deliberately — the counts are not trustworthy here.
+        if sent_any:
+            terminator_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            try:
+                yield f"data: {json.dumps(terminator_chunk, ensure_ascii=False)}\n\n"
+            except Exception:
+                pass  # Client already gone
         # Propagate error up for proper handling in routes_openai.py
         raise
     finally:
