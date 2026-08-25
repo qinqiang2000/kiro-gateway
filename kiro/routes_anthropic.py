@@ -419,6 +419,9 @@ async def messages(
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
+                # True once any chunk reached the client, which means the SSE
+                # message was opened and now has to be closed properly on error.
+                sent_any = False
                 try:
                     async for chunk in stream_kiro_to_anthropic(
                         response,
@@ -428,16 +431,24 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         tool_name_map=tool_name_map,
                     ):
+                        sent_any = True
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Send error event to client, then gracefully end the stream
+                    # Send error event to client, then gracefully end the stream.
+                    # message_start has already gone out by this point, so the
+                    # client is mid-message: stopping here leaves it waiting on a
+                    # body that never closes. Emit the SSE terminators as well so
+                    # it can finalize instead of reporting a truncated response.
                     try:
                         error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
                         yield error_event
+                        if sent_any:
+                            yield 'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\n'
+                            yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
                     except Exception:
                         pass
                 finally:
