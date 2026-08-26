@@ -473,3 +473,80 @@ class TestToolDescriptionFallback:
         assert specs["kept"] == "real description"
         # No description is ever the empty string.
         assert all(len(d) >= 1 for d in specs.values())
+
+
+class TestWebSearchConversion:
+    def test_native_web_search_gets_query_schema(self):
+        # Native server tool: has `type`, no input_schema. Must get a {query} schema.
+        payload = {
+            "model": "claude-opus-4-8", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        }
+        out = anthropic_to_converse(payload)
+        spec = out["toolConfig"]["tools"][0]["toolSpec"]
+        assert spec["name"] == "web_search"
+        schema = spec["inputSchema"]["json"]
+        assert schema["properties"]["query"]["type"] == "string"
+        assert schema["required"] == ["query"]
+        assert len(spec["description"]) >= 1
+
+
+class TestWebSearchLoop:
+    @pytest.mark.asyncio
+    async def test_loop_executes_search_and_feeds_back(self, monkeypatch):
+        import quick.agent_loop as al
+
+        # Round 1: model asks for web_search. Round 2: model answers with text.
+        rounds = [
+            {"content": [{"type": "tool_use", "id": "t1", "name": "web_search",
+                          "input": {"query": "Anthropic news"}}], "stop_reason": "tool_use"},
+            {"content": [{"type": "text", "text": "Anthropic released X."}], "stop_reason": "end_turn"},
+        ]
+        calls = {"n": 0, "searched": []}
+
+        class _FakeAgg:
+            def __init__(self, *a): self.error = None; self._i = calls["n"]
+            def result(self): return rounds[self._i]
+
+        async def _fake_round(ci, mid, model):
+            agg = _FakeAgg()
+            calls["n"] += 1
+            return agg
+
+        async def _fake_search(query, max_results=6):
+            calls["searched"].append(query)
+            return [{"title": "T", "url": "https://x", "snippet": "S"}]
+
+        monkeypatch.setattr(al, "_run_one_round", _fake_round)
+        monkeypatch.setattr(al, "search_web", _fake_search)
+
+        ci = {"messages": [{"role": "user", "content": [{"text": "what's new?"}]}]}
+        final, err = await al.run_websearch_loop(ci, "msg_1", "m")
+        assert err is None
+        assert final["content"][0]["text"] == "Anthropic released X."
+        assert calls["searched"] == ["Anthropic news"]        # search actually ran
+        # transcript grew by assistant(tool_use)+user(toolResult)
+        assert any(m["role"] == "user" and "toolResult" in m["content"][0] for m in ci["messages"])
+
+    @pytest.mark.asyncio
+    async def test_loop_returns_non_websearch_tool_use_immediately(self, monkeypatch):
+        import quick.agent_loop as al
+        # Model calls a DIFFERENT tool → loop must return it as-is (client handles it).
+        msg = {"content": [{"type": "tool_use", "id": "t9", "name": "get_weather",
+                            "input": {"city": "SF"}}], "stop_reason": "tool_use"}
+
+        class _FakeAgg:
+            error = None
+            def result(self): return msg
+
+        async def _fake_round(ci, mid, model): return _FakeAgg()
+        searched = []
+        async def _fake_search(q, max_results=6): searched.append(q); return []
+        monkeypatch.setattr(al, "_run_one_round", _fake_round)
+        monkeypatch.setattr(al, "search_web", _fake_search)
+
+        final, err = await al.run_websearch_loop({"messages": []}, "msg_1", "m")
+        assert err is None
+        assert final["content"][0]["name"] == "get_weather"
+        assert searched == []   # never executed a search

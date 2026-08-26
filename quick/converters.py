@@ -153,7 +153,14 @@ def _messages_to_converse(messages: List[JsonDict]) -> List[JsonDict]:
 def _tools_to_converse(
     tools: Optional[List[JsonDict]], tool_choice: Optional[JsonDict]
 ) -> Optional[JsonDict]:
-    """Convert Anthropic tools + tool_choice into a Converse ``toolConfig``."""
+    """Convert Anthropic tools + tool_choice into a Converse ``toolConfig``.
+
+    Native server-side tools (identified by a ``type`` field, e.g.
+    ``web_search_20250305``) carry no ``input_schema``. For ``web_search`` the
+    gateway executes the search itself (see :mod:`quick.websearch`), so we give it
+    a concrete ``{query}`` schema here — otherwise the model gets an empty object
+    schema and may not emit a usable query.
+    """
     if not tools:
         return None
     spec_tools: List[JsonDict] = []
@@ -166,12 +173,22 @@ def _tools_to_converse(
         # tool name (semantic, non-misleading) so an empty description doesn't get
         # the whole request rejected with a Bedrock validation error.
         description = (tool.get("description") or "").strip() or name
+        input_schema = tool.get("input_schema")
+        is_native = bool(tool.get("type"))  # server-side tools carry a `type`
+        if name == "web_search" and (is_native or not input_schema):
+            # Gateway-executed web_search: give the model a real query schema.
+            description = description if description != name else "Search the web for current information."
+            input_schema = {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "The search query."}},
+                "required": ["query"],
+            }
         spec_tools.append(
             {
                 "toolSpec": {
                     "name": name,
                     "description": description,
-                    "inputSchema": {"json": tool.get("input_schema", {"type": "object"})},
+                    "inputSchema": {"json": input_schema or {"type": "object"}},
                 }
             }
         )
