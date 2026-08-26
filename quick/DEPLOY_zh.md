@@ -79,6 +79,22 @@ python -c "from quick.auth import QuickAuthManager; QuickAuthManager()._load()"
 
 ---
 
+## 3.5 一键部署（推荐）：`quick/deploy.sh`
+
+第 4 节的所有步骤（同步代码、上传凭证、chown 999、构建、健康检查、冒烟测试）已固化为
+幂等脚本。生成好缓存文件（第 3 节）后，直接：
+
+```bash
+./quick/deploy.sh                                  # 用默认主机/密钥
+HOST=1.2.3.4 PEM=~/xxx.pem ./quick/deploy.sh       # 换主机
+./quick/deploy.sh --no-creds                       # 只更新代码，不动远程凭证
+./quick/deploy.sh --creds-only                     # 只换凭证并重启（如轮到新账号/续期）
+```
+
+脚本要点：用 `rsync --checksum` 按内容同步（避免时间戳漏更新的坑）、**绝不 `--delete`
+且排除 `quickwork/`**（永不误删远程凭证）、自动把凭证 chown 给 uid 999。
+下面第 4 节是脚本背后手动等价步骤，供排查时参考。
+
 ## 4. 拷贝到目标机器（Linux）并部署
 
 ### 4.1 拷贝凭证
