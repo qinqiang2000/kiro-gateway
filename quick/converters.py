@@ -42,7 +42,13 @@ def _system_to_converse(system: Union[None, str, List[JsonDict]]) -> List[JsonDi
 
 
 def _image_block(source: JsonDict) -> Optional[JsonDict]:
-    """Convert an Anthropic image source into a Converse image block."""
+    """Convert an Anthropic image source into a Converse image block.
+
+    The DataPlane request is serialized as JSON (see :func:`quick.client._envelope`),
+    so ``source.bytes`` must be a base64 *string*, not raw ``bytes`` (json.dumps
+    cannot serialize bytes). Anthropic already sends base64, so we validate and pass
+    the string straight through rather than decoding and re-encoding.
+    """
     if source.get("type") != "base64":
         # URL images are not supported by Converse's inline bytes model.
         return None
@@ -51,11 +57,15 @@ def _image_block(source: JsonDict) -> Optional[JsonDict]:
     # Converse accepts: png | jpeg | gif | webp
     if fmt == "jpg":
         fmt = "jpeg"
+    data = source.get("data", "")
+    if not data or not isinstance(data, str):
+        return None
+    # Validate it is real base64 (reject garbage) but keep the string form for JSON.
     try:
-        raw = base64.b64decode(source.get("data", ""))
+        base64.b64decode(data, validate=True)
     except (ValueError, TypeError):
         return None
-    return {"image": {"format": fmt, "source": {"bytes": raw}}}
+    return {"image": {"format": fmt, "source": {"bytes": data}}}
 
 
 def _tool_result_content(content: Union[str, List[JsonDict], None]) -> List[JsonDict]:
