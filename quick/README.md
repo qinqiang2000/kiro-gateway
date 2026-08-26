@@ -103,7 +103,33 @@ stream path and aggregates for non-streaming responses.
 | `converters.py` | Anthropic Messages → Bedrock `Converse` input |
 | `streaming.py` | event-stream decoder, `bedrockStreamEvent` unwrap, SSE translator + aggregator |
 | `client.py` | DataPlane HTTP client (envelope + id_token bearer + retry) |
+| `websearch.py` | key-less DuckDuckGo web search (executes `web_search` gateway-side) |
+| `agent_loop.py` | model↔web_search loop (Path B): run, search, feed back, repeat |
 | `routes.py` | FastAPI `/quick/v1/messages` |
+
+## Tools
+
+**Function tools** pass through: the client's tools become a Converse `toolConfig`,
+the model emits `tool_use`, and the gateway returns it for the client to execute
+(empty tool descriptions fall back to the tool name — Bedrock requires length ≥ 1).
+
+**`web_search`** — Amazon Quick's Bedrock backend does **not** run Anthropic's
+native server-side `web_search`. The gateway executes it itself (Path B, like
+kiro-gateway): when the model calls `web_search`, `agent_loop.py` runs a key-less
+DuckDuckGo search (`websearch.py`, via the bundled httpx — no API key, no extra
+dependency), feeds the results back as a Converse `toolResult`, and re-invokes the
+model, looping until it answers (bounded by `MAX_SEARCH_ROUNDS`). Any *other*
+tool the model calls is returned to the client untouched.
+
+> Caveat: DuckDuckGo's HTML endpoint has no official API contract — if results
+> suddenly come back empty, DDG likely changed its markup or rate-limited us;
+> update the regex in `websearch.py` or swap the source.
+
+**`web_fetch`** — needs no gateway handling; it already works as a pass-through.
+
+**Images** — `image` blocks pass through as base64 *strings* (the DataPlane request
+is JSON, so `source.bytes` is a base64 string, not raw bytes — verified live).
+`jpg`→`jpeg`; invalid base64 is dropped rather than crashing.
 
 ## Models
 
