@@ -1,0 +1,36 @@
+# Standalone quick-gateway deployment (project: quick-gateway).
+# Isolated from the prod /opt/kiro-gateway stack — its own image, network, and
+# single container. Serves ONLY the Anthropic-compatible /quick/v1/messages endpoint
+# backed by the Amazon Quick DataPlane. The Kiro /v1/* routes in the same image are
+# inert here (no real Kiro creds); REFRESH_TOKEN=dummy only satisfies main.py's
+# startup credential check.
+services:
+  quick-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: quick-gateway:latest
+    container_name: quick-gateway
+    ports:
+      - "8000:8000"          # host 8000 (free) -> container 8000
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - LOG_LEVEL=INFO
+      - DEBUG_MODE=off
+      # Satisfy main.py startup guard; Kiro routes unused in this container.
+      - REFRESH_TOKEN=dummy-quick-only
+      - PROXY_API_KEY=quick-gw-kingdee-2026
+      # Portable Quick creds (scp'd from mac). Container runs as user 'kiro'.
+      - QUICK_CREDS_FILE=/home/kiro/.quickwork/gateway-creds.json
+      # Force every request to the best authorized Opus (opus-5 is IAM-denied).
+      - QUICK_FORCE_MODEL=us.anthropic.claude-opus-4-8
+    volumes:
+      - ./quickwork:/home/kiro/.quickwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

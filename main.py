@@ -602,6 +602,15 @@ app.include_router(openai_router)
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
 
+# Amazon Quick backend (Anthropic-compatible): /quick/v1/messages.
+try:
+    from quick.routes import router as quick_router
+
+    app.include_router(quick_router)
+    logger.info("Quick gateway routes registered at /quick/v1/messages")
+except Exception as _quick_exc:  # noqa: BLE001 - Quick backend is optional
+    logger.warning(f"Quick gateway routes not registered: {_quick_exc}")
+
 # Web UI management dashboard
 app.include_router(ui_router)
 
