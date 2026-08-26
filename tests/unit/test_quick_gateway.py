@@ -550,3 +550,44 @@ class TestWebSearchLoop:
         assert err is None
         assert final["content"][0]["name"] == "get_weather"
         assert searched == []   # never executed a search
+
+
+class TestImageBlock:
+    def test_image_source_is_json_serializable_base64_string(self):
+        import base64 as _b64, json as _json
+        # 1x1 transparent PNG
+        png_b64 = _b64.b64encode(bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+            "890000000a49444154789c6360000002000154a24f8b0000000049454e44ae426082"
+        )).decode()
+        payload = {
+            "model": "claude-opus-4-8", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": "image/png", "data": png_b64}},
+            ]}],
+        }
+        out = anthropic_to_converse(payload)
+        # Must serialize without a bytes TypeError (the original bug).
+        blob = _json.dumps({"modelId": out["modelId"], "requestBody": out})
+        assert "image" in blob
+        # Find the image block; its source.bytes must be the base64 STRING.
+        content = out["messages"][0]["content"]
+        img = next(b for b in content if "image" in b)["image"]
+        assert img["format"] == "png"
+        assert img["source"]["bytes"] == png_b64
+        assert isinstance(img["source"]["bytes"], str)
+
+    def test_jpg_normalized_and_bad_base64_dropped(self):
+        # jpg -> jpeg; invalid base64 -> block dropped (no crash).
+        payload = {
+            "model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpg",
+                                             "data": "not!!base64"}},
+            ]}],
+        }
+        out = anthropic_to_converse(payload)
+        content = out["messages"][0]["content"]
+        assert not any("image" in b for b in content)  # bad base64 dropped
