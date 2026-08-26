@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Kiro Gateway is a Python FastAPI proxy that exposes OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`) APIs, translating requests to the Kiro API (AWS CodeWhisperer). It handles auth, streaming, model resolution, and format conversion.
 
+**Sibling backend — Amazon Quick** (`quick/`): a parallel Anthropic-compatible endpoint `POST /quick/v1/messages` that targets the Amazon Quick backend instead of Kiro, wired into the same `main.py`. To run or deploy it (locally or on a server, incl. new machine/account), follow **`quick/RUNBOOK.md`**; protocol/design details are in `quick/README.md`.
+
 ## Commands
 
 ```bash
