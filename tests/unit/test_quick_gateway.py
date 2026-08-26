@@ -402,3 +402,48 @@ class TestAuthRefresh:
         on_disk = json.loads(creds_file.read_text(encoding="utf-8"))
         assert on_disk["refresh_token"] == "RT1"
         assert on_disk["id_token"] == "ID1"
+
+
+class TestKeepalive:
+    @pytest.mark.asyncio
+    async def test_keepalive_forces_refresh_even_when_token_valid(self, creds_file, monkeypatch):
+        # Arrange: seed cache with a NON-expired id_token (get_credentials would NOT refresh).
+        creds_file.write_text(json.dumps(_sample_blob()), encoding="utf-8")
+        import quick.auth as qa
+
+        rotated = {"access_token": "AT2", "id_token": "ID2", "refresh_token": "RT2", "expires_in": 300}
+
+        class _FakeAsyncClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _FakeResponse(200, rotated)
+
+        monkeypatch.setattr(qa.httpx, "AsyncClient", _FakeAsyncClient)
+        # Act: keepalive must refresh unconditionally (unlike get_credentials).
+        mgr = qa.QuickAuthManager()
+        await mgr.keepalive()
+        # Assert: rotated + persisted despite the seed token being valid.
+        on_disk = json.loads(creds_file.read_text(encoding="utf-8"))
+        assert on_disk["refresh_token"] == "RT2"
+        assert on_disk["id_token"] == "ID2"
+
+    @pytest.mark.asyncio
+    async def test_keepalive_loop_disabled_returns_immediately(self, monkeypatch):
+        # Arrange: interval 0 disables the loop; it must return without sleeping/refreshing.
+        import quick.auth as qa
+        monkeypatch.setattr(qa, "QUICK_KEEPALIVE_INTERVAL", 0)
+
+        async def _boom():
+            raise AssertionError("keepalive must not run when disabled")
+
+        monkeypatch.setattr(qa.quick_auth_manager, "keepalive", _boom)
+        # Act / Assert: returns promptly, no exception.
+        await qa.keepalive_loop()

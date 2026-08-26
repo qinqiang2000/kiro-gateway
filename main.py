@@ -547,6 +547,18 @@ async def lifespan(app: FastAPI):
     )
     logger.info(f"Background credential refresh task started (interval: {CRED_RELOAD_INTERVAL}s)")
 
+    # --- Quick keep-alive task (optional) ---
+    # The Quick /quick/* routes refresh the short-lived id_token lazily on the request
+    # path. This extra task only guards the long-lived (~90-day) offline refresh_token
+    # from lapsing during long idle periods. Fully optional and isolated from Kiro.
+    quick_keepalive_task = None
+    try:
+        from quick.auth import keepalive_loop as _quick_keepalive_loop
+
+        quick_keepalive_task = asyncio.create_task(_quick_keepalive_loop())
+    except Exception as _qk_exc:  # noqa: BLE001 - Quick backend is optional
+        logger.warning(f"Quick keep-alive task not started: {_qk_exc}")
+
     yield
 
     # Graceful shutdown
@@ -555,6 +567,13 @@ async def lifespan(app: FastAPI):
         await refresh_task
     except asyncio.CancelledError:
         pass
+
+    if quick_keepalive_task is not None:
+        quick_keepalive_task.cancel()
+        try:
+            await quick_keepalive_task
+        except asyncio.CancelledError:
+            pass
 
     logger.info("Shutting down application...")
     try:

@@ -55,6 +55,13 @@ QUICK_CREDS_FILE: Path = Path(
 # Refresh a bit before the (~5 min) access-token expiry to avoid races.
 TOKEN_REFRESH_THRESHOLD_SECONDS: int = 60
 
+# Keep-alive interval (seconds) for the background Quick refresh task. The id_token
+# lives only ~5 min and is refreshed lazily on the request path, so this loop exists
+# ONLY to stop the long-lived (~90-day) refresh_token from silently lapsing when the
+# gateway sees zero traffic for a long time. Once a day is ample for a 90-day window
+# and keeps the logs quiet. Set QUICK_KEEPALIVE_INTERVAL=0 to disable the task.
+QUICK_KEEPALIVE_INTERVAL: int = int(os.getenv("QUICK_KEEPALIVE_INTERVAL", "86400"))
+
 # The token_endpoint / client_id normally come straight from the Keychain blob
 # (keys ``token_endpoint`` and ``client_id``); these are only fallbacks.
 DEFAULT_CLIENT_ID: str = "quick-desktop"

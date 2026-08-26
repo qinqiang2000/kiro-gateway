@@ -41,6 +41,7 @@ from quick.config import (
     KEYCHAIN_SERVICE_PREFIX,
     PROFILES_JSON,
     QUICK_CREDS_FILE,
+    QUICK_KEEPALIVE_INTERVAL,
     QUICK_PROFILE_ID,
     QUICK_TENANT_URL,
     TOKEN_REFRESH_THRESHOLD_SECONDS,
@@ -334,6 +335,47 @@ class QuickAuthManager:
         async with self._lock:
             self._creds = None
 
+    async def keepalive(self) -> None:
+        """Unconditionally refresh once to keep the ~90-day refresh_token alive.
+
+        The request path already refreshes the short-lived id_token on demand, so this
+        is only useful during long idle periods (no requests) to prevent the offline
+        refresh_token from silently lapsing. Loads credentials first if needed. Errors
+        propagate to the caller (the background loop logs and retries).
+        """
+        async with self._lock:
+            if self._creds is None:
+                self._creds = self._load()
+            await self._refresh(self._creds)
+
 
 # Module-level singleton, mirroring kiro.auth usage.
 quick_auth_manager = QuickAuthManager()
+
+
+async def keepalive_loop() -> None:
+    """Background task: periodically refresh Quick creds so the offline token survives.
+
+    Runs forever on :data:`QUICK_KEEPALIVE_INTERVAL`. Does nothing (returns immediately)
+    when the interval is 0. Each failure is logged and retried on the next tick; a
+    failure never crashes the task or the app. Cancellation (on shutdown) is clean.
+    """
+    if QUICK_KEEPALIVE_INTERVAL <= 0:
+        logger.info("Quick keep-alive disabled (QUICK_KEEPALIVE_INTERVAL=0).")
+        return
+    logger.info(
+        "Quick keep-alive task started (interval: {}s).", QUICK_KEEPALIVE_INTERVAL
+    )
+    while True:
+        await asyncio.sleep(QUICK_KEEPALIVE_INTERVAL)
+        try:
+            await quick_auth_manager.keepalive()
+            logger.debug("Quick keep-alive refresh ok.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep-alive must never crash the app
+            logger.warning(
+                "Quick keep-alive refresh failed ({}); retry in {}s.",
+                exc,
+                QUICK_KEEPALIVE_INTERVAL,
+            )
