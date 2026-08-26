@@ -447,3 +447,29 @@ class TestKeepalive:
         monkeypatch.setattr(qa.quick_auth_manager, "keepalive", _boom)
         # Act / Assert: returns promptly, no exception.
         await qa.keepalive_loop()
+
+
+class TestToolDescriptionFallback:
+    def test_empty_tool_description_falls_back_to_name(self):
+        # Bedrock rejects toolSpec.description length 0; Anthropic allows empty.
+        payload = {
+            "model": "claude-opus-4-8",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "web_search", "description": "", "input_schema": {"type": "object"}},
+                {"name": "no_desc_key", "input_schema": {"type": "object"}},
+                {"name": "spaces_only", "description": "   ", "input_schema": {"type": "object"}},
+                {"name": "kept", "description": "real description", "input_schema": {"type": "object"}},
+            ],
+        }
+        out = anthropic_to_converse(payload)
+        specs = {t["toolSpec"]["name"]: t["toolSpec"]["description"] for t in out["toolConfig"]["tools"]}
+        # Empty / missing / whitespace-only -> tool name (non-empty, satisfies Bedrock).
+        assert specs["web_search"] == "web_search"
+        assert specs["no_desc_key"] == "no_desc_key"
+        assert specs["spaces_only"] == "spaces_only"
+        # Real descriptions are preserved verbatim.
+        assert specs["kept"] == "real description"
+        # No description is ever the empty string.
+        assert all(len(d) >= 1 for d in specs.values())

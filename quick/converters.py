@@ -161,11 +161,16 @@ def _tools_to_converse(
         name = tool.get("name")
         if not name:
             continue
+        # Bedrock Converse requires toolSpec.description length >= 1, but the
+        # Anthropic protocol allows an empty/omitted description. Fall back to the
+        # tool name (semantic, non-misleading) so an empty description doesn't get
+        # the whole request rejected with a Bedrock validation error.
+        description = (tool.get("description") or "").strip() or name
         spec_tools.append(
             {
                 "toolSpec": {
                     "name": name,
-                    "description": tool.get("description", "") or "",
+                    "description": description,
                     "inputSchema": {"json": tool.get("input_schema", {"type": "object"})},
                 }
             }
