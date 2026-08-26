@@ -30,6 +30,7 @@ from quick.streaming import (
     ConverseAggregator,
     ConverseToAnthropicSSE,
     EventStreamDecoder,
+    _sse,
 )
 
 router = APIRouter(tags=["Quick API"])
@@ -38,6 +39,72 @@ router = APIRouter(tags=["Quick API"])
 def _message_id() -> str:
     """Generate an Anthropic-style message id."""
     return f"msg_{uuid.uuid4().hex[:24]}"
+
+
+def _wants_websearch(payload: Dict[str, Any]) -> bool:
+    """True if the request offers a ``web_search`` tool the gateway must execute."""
+    for tool in payload.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("name") == "web_search":
+            return True
+    return False
+
+
+async def _replay_message_as_sse(
+    message: Dict[str, Any], message_id: str, model: str
+) -> AsyncGenerator[str, None]:
+    """Re-emit a fully-assembled Anthropic message as an Anthropic SSE stream.
+
+    Used after the web_search loop (which is internally non-streaming) when the
+    client asked for ``stream: true``. Text blocks are chunked; tool_use blocks are
+    emitted whole with their input as a single ``input_json_delta``.
+    """
+    usage = message.get("usage", {}) or {}
+    yield _sse("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": message_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 0},
+        },
+    })
+    yield "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+
+    for idx, block in enumerate(message.get("content", [])):
+        btype = block.get("type")
+        if btype == "text":
+            yield _sse("content_block_start", {
+                "type": "content_block_start", "index": idx,
+                "content_block": {"type": "text", "text": ""}})
+            text = block.get("text", "")
+            for i in range(0, len(text), 100):
+                yield _sse("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": text[i:i + 100]}})
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        elif btype == "tool_use":
+            yield _sse("content_block_start", {
+                "type": "content_block_start", "index": idx,
+                "content_block": {"type": "tool_use", "id": block.get("id", ""),
+                                  "name": block.get("name", ""), "input": {}}})
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta", "index": idx,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False)}})
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        elif btype == "thinking":
+            yield _sse("content_block_start", {
+                "type": "content_block_start", "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta", "index": idx,
+                "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")}})
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+
+    yield _sse("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": message.get("stop_reason", "end_turn"), "stop_sequence": None},
+        "usage": {"output_tokens": usage.get("output_tokens", 0)}})
+    yield _sse("message_stop", {"type": "message_stop"})
 
 
 def _error_response(status: int, message: str, err_type: str = "api_error") -> JSONResponse:
@@ -67,6 +134,33 @@ async def quick_messages(request: Request) -> Any:
         return _error_response(400, f"Request conversion failed: {exc}", "invalid_request_error")
 
     message_id = _message_id()
+
+    # Gateway-executed web_search (Path B): if the client offered a web_search tool,
+    # the Quick/Bedrock backend won't run it, so we drive the model↔search loop here
+    # and return the model's final answer. web_fetch and other tools are unaffected.
+    if _wants_websearch(payload):
+        from quick.agent_loop import run_websearch_loop
+
+        try:
+            final, err = await run_websearch_loop(converse_input, message_id, model)
+        except QuickAuthError as exc:
+            return _error_response(401, str(exc), "authentication_error")
+        except QuickAPIError as exc:
+            return _error_response(exc.status_code if exc.status_code >= 400 else 502, exc.message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Quick web_search loop failed")
+            return _error_response(502, str(exc))
+        if err:
+            status = 403 if "not authorized" in err.lower() else 502
+            logger.warning("Quick backend error (web_search loop): {}", err[:200])
+            return _error_response(status, err)
+        if stream:
+            return StreamingResponse(
+                _replay_message_as_sse(final, message_id, model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        return JSONResponse(content=final)
 
     if stream:
         return StreamingResponse(
