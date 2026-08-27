@@ -58,10 +58,11 @@ quick-gateway is Anthropic-compatible. Add to litellm `config.yaml` (back it up 
 `model_name: claude-opus-quick` → `docker restart litellm`. (Container must share
 litellm's docker network.)
 
-**Cost tracking**: Quick is a flat-rate account, so price it at **1/10 of Anthropic's
-official Opus 4.8 list price** ($5 / $25 per MTok) — `input_cost_per_token: 5.0e-07`,
-`output_cost_per_token: 2.5e-06`. Note the box's own `claude-opus-4-8` entry uses an
-internal rate (`1.5e-05` / `7.5e-05`, 3x list) — do **not** derive the quick price from it.
+**Cost tracking**: every Claude entry on the box is priced at Anthropic's official list
+rate (as of 2026-08-27: Opus $5/$25, Sonnet 5 $2/$10, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5
+per MTok). Quick is a flat-rate account, so `claude-opus-quick` is priced at **1/10 of
+official Opus** — `input_cost_per_token: 5.0e-07`, `output_cost_per_token: 2.5e-06`.
+Each model has two entries (`claude-x` and `us.anthropic.claude-x`) — change both.
 litellm only reads these on restart; verify with
 `curl -s localhost:4000/v1/model/info -H "Authorization: Bearer <master-key>"` and by
 checking `spend` on the next `LiteLLM_SpendLogs` row.
