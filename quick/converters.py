@@ -24,6 +24,56 @@ from quick.config import resolve_model
 JsonDict = Dict[str, Any]
 
 
+# Bedrock's equivalent of an Anthropic ``cache_control`` breakpoint. Anthropic marks
+# the block *up to and including which* the prefix should be cached; Bedrock wants a
+# separator right after it — so a marked block becomes "block, cachePoint".
+CACHE_POINT: JsonDict = {"cachePoint": {"type": "default"}}
+
+# Bedrock rejects a request with more than this many cache points outright
+# (ValidationException 400, verified live). Anthropic's own limit is the same, so a
+# well-behaved client never trips it — but a 400 here would take down a real request,
+# so the converter caps instead of trusting the client.
+MAX_CACHE_POINTS: int = 4
+
+
+def _is_cached(block: object) -> bool:
+    """True when an Anthropic block carries a ``cache_control`` breakpoint."""
+    return isinstance(block, dict) and isinstance(block.get("cache_control"), dict)
+
+
+def _cap_cache_points(result: JsonDict, limit: int = MAX_CACHE_POINTS) -> None:
+    """Drop the earliest cache points until at most ``limit`` remain, in place.
+
+    The prefix order Bedrock caches in is tools → system → messages, so the *last*
+    breakpoints cover the longest prefixes and are worth the most; an earlier one is
+    already contained in every later prefix. Hence extras are dropped from the front.
+    """
+    lists: List[List[JsonDict]] = []
+    tool_config = result.get("toolConfig")
+    if isinstance(tool_config, dict) and isinstance(tool_config.get("tools"), list):
+        lists.append(tool_config["tools"])
+    if isinstance(result.get("system"), list):
+        lists.append(result["system"])
+    for message in result.get("messages") or []:
+        if isinstance(message, dict) and isinstance(message.get("content"), list):
+            lists.append(message["content"])
+
+    total = sum(1 for blocks in lists for b in blocks if "cachePoint" in b)
+    excess = total - limit
+    if excess <= 0:
+        return
+    for blocks in lists:
+        i = 0
+        while i < len(blocks) and excess > 0:
+            if "cachePoint" in blocks[i]:
+                del blocks[i]
+                excess -= 1
+                continue
+            i += 1
+        if excess <= 0:
+            break
+
+
 def _system_to_converse(system: Union[None, str, List[JsonDict]]) -> List[JsonDict]:
     """Convert an Anthropic ``system`` field into Converse ``system`` blocks."""
     if not system:
@@ -36,6 +86,8 @@ def _system_to_converse(system: Union[None, str, List[JsonDict]]) -> List[JsonDi
             text = item.get("text", "")
             if text:
                 blocks.append({"text": text})
+                if _is_cached(item):
+                    blocks.append(dict(CACHE_POINT))
         elif isinstance(item, str) and item:
             blocks.append({"text": item})
     return blocks
@@ -141,6 +193,8 @@ def _content_to_converse(content: Union[str, List[JsonDict]]) -> List[JsonDict]:
         elif btype == "redacted_thinking":
             blocks.append({"reasoningContent": {"redactedContent": block.get("data", "").encode()}})
         # Unknown block types are dropped (transparent-proxy: don't invent content).
+        if _is_cached(block) and blocks and "cachePoint" not in blocks[-1]:
+            blocks.append(dict(CACHE_POINT))
     return blocks or [{"text": ""}]
 
 
@@ -204,6 +258,10 @@ def _tools_to_converse(
         )
     if not spec_tools:
         return None
+    # A cache_control on any tool caches the whole tool block (Bedrock has one
+    # cache point for the tool list, at its end).
+    if any(_is_cached(tool) for tool in tools):
+        spec_tools.append(dict(CACHE_POINT))
     tool_config: JsonDict = {"tools": spec_tools}
     if tool_choice:
         ctype = tool_choice.get("type")
@@ -226,7 +284,9 @@ def anthropic_to_converse(payload: JsonDict) -> JsonDict:
         A dict with ``modelId``, ``messages`` and optional ``system``,
         ``inferenceConfig``, ``toolConfig`` and ``additionalModelRequestFields``
         (Bedrock ``Converse`` shape). :mod:`quick.client` decides the final RPC
-        envelope around this.
+        envelope around this. Client ``cache_control`` breakpoints are passed
+        through as Bedrock ``cachePoint`` separators (capped at
+        :data:`MAX_CACHE_POINTS`).
     """
     model = resolve_model(payload.get("model"))
     result: JsonDict = {
@@ -267,6 +327,10 @@ def anthropic_to_converse(payload: JsonDict) -> JsonDict:
         result["_quick_output_config"] = {"effort": _budget_to_effort(thinking.get("budget_tokens"))}
     if additional:
         result["additionalModelRequestFields"] = additional
+
+    # Cache points are passed through from the client's cache_control markers; more
+    # than four is a hard 400 from Bedrock, so trim before it can reach the wire.
+    _cap_cache_points(result)
 
     return result
 

@@ -209,6 +209,24 @@ def _sse(event: str, data: JsonDict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _cache_usage(usage: JsonDict) -> JsonDict:
+    """Anthropic-shaped cache counters from a Converse ``usage``, omitted when zero.
+
+    Bedrock reports ``cacheReadInputTokens`` / ``cacheWriteInputTokens`` only when the
+    request carried cache points, and the cached share is excluded from
+    ``inputTokens``. Passing them back keeps the client's (and litellm's) accounting
+    honest — and is the only way the cache win is visible downstream.
+    """
+    out: JsonDict = {}
+    read = usage.get("cacheReadInputTokens") or 0
+    write = usage.get("cacheWriteInputTokens") or 0
+    if read:
+        out["cache_read_input_tokens"] = read
+    if write:
+        out["cache_creation_input_tokens"] = write
+    return out
+
+
 class ConverseToAnthropicSSE:
     """Stateful translator from Bedrock Converse events to Anthropic SSE strings.
 
@@ -223,6 +241,7 @@ class ConverseToAnthropicSSE:
         # Maps Converse contentBlockIndex -> Anthropic block type currently open.
         self._open_blocks: Dict[int, str] = {}
         self._input_tokens = 0
+        self._cache_usage: JsonDict = {}
         self._output_tokens = 0
         self._stop_reason: Optional[str] = None
         self._started = False
@@ -339,6 +358,7 @@ class ConverseToAnthropicSSE:
             usage = payload.get("usage", {})
             self._input_tokens = usage.get("inputTokens", self._input_tokens)
             self._output_tokens = usage.get("outputTokens", self._output_tokens)
+            self._cache_usage = _cache_usage(usage)
             return out
 
         return out
@@ -352,7 +372,9 @@ class ConverseToAnthropicSSE:
         out.append(_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": self._stop_reason or "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": self._output_tokens},
+            # Converse only reports usage in its final metadata frame, so the cache
+            # counters can only ride the closing delta, not message_start.
+            "usage": {"output_tokens": self._output_tokens, **self._cache_usage},
         }))
         out.append(_sse("message_stop", {"type": "message_stop"}))
         return out
@@ -373,6 +395,7 @@ class ConverseAggregator:
         self._tool_json: Dict[int, str] = {}
         self._stop_reason = "end_turn"
         self._input_tokens = 0
+        self._cache_usage: JsonDict = {}
         self._output_tokens = 0
         self.error: Optional[str] = None
 
@@ -422,6 +445,7 @@ class ConverseAggregator:
             usage = payload.get("usage", {})
             self._input_tokens = usage.get("inputTokens", self._input_tokens)
             self._output_tokens = usage.get("outputTokens", self._output_tokens)
+            self._cache_usage = _cache_usage(usage)
 
     def result(self) -> JsonDict:
         """Return the assembled Anthropic Messages response."""
@@ -445,7 +469,8 @@ class ConverseAggregator:
             "content": content or [{"type": "text", "text": ""}],
             "stop_reason": self._stop_reason,
             "stop_sequence": None,
-            "usage": {"input_tokens": self._input_tokens, "output_tokens": self._output_tokens},
+            "usage": {"input_tokens": self._input_tokens,
+                      "output_tokens": self._output_tokens, **self._cache_usage},
         }
 
 
@@ -485,5 +510,6 @@ def converse_response_to_anthropic(resp: JsonDict, message_id: str, model: str) 
         "usage": {
             "input_tokens": usage.get("inputTokens", 0),
             "output_tokens": usage.get("outputTokens", 0),
+            **_cache_usage(usage),
         },
     }

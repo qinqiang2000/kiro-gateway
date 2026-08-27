@@ -77,6 +77,10 @@ Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:90
 - `QUICK_FORCE_MODEL` (default opus-4-8) forces every request to one model; opus-5 is
   IAM-denied. Empty = per-request mapping.
 - **web_search** is gateway-executed (key-less DuckDuckGo); **web_fetch**/images pass through.
+- **Prompt caching**: the client's `cache_control` is passed through as Bedrock `cachePoint`,
+  capped at 4 (a 5th is a hard 400). The cache is **shared across pool accounts** (measured),
+  so switching accounts costs no hits. A cached read costs ~40 % of a full read in Quick
+  units — it saves quota, not just latency. Details: `quick/README.md` → "Prompt caching".
 - Deploy always via `deploy.sh` (plain rsync skips edited files by mtime → stale container).
 
 ## 5. The status page (port 9090, public)

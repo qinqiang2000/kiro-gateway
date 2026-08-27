@@ -1302,3 +1302,146 @@ class TestStatusPageSafety:
         paths = {r.path for r in create_status_app("/pool-abc").routes}
 
         assert paths == {"/pool-abc", "/pool-abc/", "/pool-abc/api/pool"}
+
+
+# ==================================================================================================
+# Prompt caching: Anthropic cache_control -> Bedrock cachePoint
+# ==================================================================================================
+
+def _cache_points(obj) -> int:
+    """Count cachePoint separators anywhere in a Converse input."""
+    if isinstance(obj, dict):
+        return (1 if "cachePoint" in obj else 0) + sum(_cache_points(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_cache_points(v) for v in obj)
+    return 0
+
+
+_EPHEMERAL = {"type": "ephemeral"}
+
+
+class TestCachePointSuccess:
+    def test_system_breakpoint_becomes_a_cache_point_after_the_block(self):
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "system": [{"type": "text", "text": "big preamble", "cache_control": _EPHEMERAL}],
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+
+        assert ci["system"] == [{"text": "big preamble"}, {"cachePoint": {"type": "default"}}]
+
+    def test_message_breakpoint_is_passed_through(self):
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "transcript", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "now answer"},
+            ]}],
+        })
+
+        assert ci["messages"][0]["content"] == [
+            {"text": "transcript"}, {"cachePoint": {"type": "default"}}, {"text": "now answer"},
+        ]
+
+    def test_tool_breakpoint_caches_the_whole_tool_block(self):
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "a", "description": "d", "input_schema": {"type": "object"},
+                       "cache_control": _EPHEMERAL}],
+        })
+
+        assert ci["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default"}}
+
+    def test_no_cache_control_emits_no_cache_point(self):
+        """Transparent proxy: the gateway never invents caching the client didn't ask for."""
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "system": [{"type": "text", "text": "preamble"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "tools": [{"name": "a", "description": "d", "input_schema": {"type": "object"}}],
+        })
+
+        assert _cache_points(ci) == 0
+
+
+class TestCachePointEdgeCases:
+    def test_more_than_four_breakpoints_are_capped(self):
+        """Bedrock 400s on a 5th cache point (verified live), so the converter trims."""
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "system": [{"type": "text", "text": "s", "cache_control": _EPHEMERAL}],
+            "tools": [{"name": "a", "description": "d", "input_schema": {"type": "object"},
+                       "cache_control": _EPHEMERAL}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "m1", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m2", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m3", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m4", "cache_control": _EPHEMERAL},
+            ]}],
+        })
+
+        assert _cache_points(ci) == 4
+
+    def test_the_cap_drops_the_earliest_points_first(self):
+        """The last breakpoints cover the longest prefixes; earlier ones are subsets."""
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "system": [{"type": "text", "text": "s", "cache_control": _EPHEMERAL}],
+            "tools": [{"name": "a", "description": "d", "input_schema": {"type": "object"},
+                       "cache_control": _EPHEMERAL}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "m1", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m2", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m3", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "m4", "cache_control": _EPHEMERAL},
+            ]}],
+        })
+
+        # tools came first in the prefix, so its point is the one that got dropped.
+        assert _cache_points(ci["toolConfig"]) == 0
+        assert _cache_points(ci["messages"]) == 4
+
+    def test_cache_control_on_a_dropped_block_adds_nothing(self):
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "messages": [{"role": "user", "content": [
+                {"type": "unknown_kind", "cache_control": _EPHEMERAL},
+                {"type": "text", "text": "hi"},
+            ]}],
+        })
+
+        assert _cache_points(ci) == 0
+
+    def test_tool_result_breakpoint_still_works(self):
+        ci = anthropic_to_converse({
+            "model": "claude-opus-4-8", "max_tokens": 8,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "done",
+                 "cache_control": _EPHEMERAL},
+            ]}],
+        })
+
+        assert ci["messages"][0]["content"][-1] == {"cachePoint": {"type": "default"}}
+
+    def test_cache_counters_reach_the_client(self):
+        """The cache win is only visible downstream if the counters are passed back."""
+        frame = _quick_frame("metadata", {"usage": {
+            "inputTokens": 12, "outputTokens": 4,
+            "cacheReadInputTokens": 12744, "cacheWriteInputTokens": 0}})
+        aggregator = ConverseAggregator("msg_1", "m")
+
+        for event in EventStreamDecoder().feed(frame):
+            aggregator.add(event)
+
+        assert aggregator.result()["usage"] == {
+            "input_tokens": 12, "output_tokens": 4, "cache_read_input_tokens": 12744}
+
+    def test_uncached_usage_keeps_the_plain_two_field_shape(self):
+        frame = _quick_frame("metadata", {"usage": {"inputTokens": 9, "outputTokens": 2}})
+        aggregator = ConverseAggregator("msg_1", "m")
+
+        for event in EventStreamDecoder().feed(frame):
+            aggregator.add(event)
+
+        assert aggregator.result()["usage"] == {"input_tokens": 9, "output_tokens": 2}

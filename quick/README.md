@@ -438,6 +438,50 @@ docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch -
 > them** (the deployed container), like `model_watch --probe`.
 
 
+## Prompt caching
+
+Client `cache_control` breakpoints are **passed through** as Bedrock `cachePoint`
+separators — in `system`, in message content, and after the tool list. Anthropic marks
+the block *up to and including which* to cache; Bedrock wants a separator right after
+it, so a marked block becomes `block, cachePoint`. The gateway never invents a cache
+point the client did not ask for.
+
+Two boundaries, both probed live:
+
+* **At most 4 cache points**, or Bedrock rejects the whole request:
+  `ValidationException: A maximum of 4 blocks with cache_control may be provided.
+  Found 5.` The converter therefore caps at `MAX_CACHE_POINTS`, dropping the
+  *earliest* points — those cover the shortest prefixes and are contained in every
+  later one.
+* **A prefix below the cacheable minimum is silently ignored** (no error, `write=0`),
+  so no size guard is needed.
+
+The response carries `cache_read_input_tokens` / `cache_creation_input_tokens` back to
+the client (Bedrock excludes the cached share from `inputTokens`), which is the only
+way the win is visible downstream.
+
+### The cache is shared across pool accounts
+
+Measured: a cold request on account `b` wrote 13264 tokens, the same prefix on account
+**`default`** then read all 13264 from cache. Both accounts sit on the same tenant
+DataPlane and the same AWS account, and the id_token identifies only the Quick *user*,
+which the Bedrock-side cache key does not include. **So the pool's per-request account
+switching costs nothing in cache hits** — no session affinity is needed.
+
+### What it saves
+
+Measured on 12 requests × 204k tokens each (idle control window confirmed the
+concurrent traffic contributed 0 units):
+
+| | units consumed | wall time |
+|---|---|---|
+| no cache points | **10** (~0.83/request) | 84 s |
+| with cache points | **5**, including the initial write | 55 s |
+
+So Quick's monthly *units* track tokens (~245k tokens per unit uncached), a cached read
+is billed at roughly 40 % of a full read, and the same workload runs ~35 % faster.
+Caching is worth real quota here, not just latency.
+
 ## Thinking (extended reasoning)
 
 Quick's models use **adaptive** thinking with an effort level (the app's
