@@ -559,6 +559,17 @@ async def lifespan(app: FastAPI):
     except Exception as _qk_exc:  # noqa: BLE001 - Quick backend is optional
         logger.warning(f"Quick keep-alive task not started: {_qk_exc}")
 
+    # --- Quick model watch (optional) ---
+    # Polls Quick's PUBLIC model-registry config (a CDN object, no credentials, no
+    # DataPlane traffic) and alerts when a newer model appears. See quick/model_watch.py.
+    quick_model_watch_task = None
+    try:
+        from quick.model_watch import watch_loop as _quick_model_watch_loop
+
+        quick_model_watch_task = asyncio.create_task(_quick_model_watch_loop())
+    except Exception as _qmw_exc:  # noqa: BLE001 - Quick backend is optional
+        logger.warning(f"Quick model watch task not started: {_qmw_exc}")
+
     yield
 
     # Graceful shutdown
@@ -572,6 +583,13 @@ async def lifespan(app: FastAPI):
         quick_keepalive_task.cancel()
         try:
             await quick_keepalive_task
+        except asyncio.CancelledError:
+            pass
+
+    if quick_model_watch_task is not None:
+        quick_model_watch_task.cancel()
+        try:
+            await quick_model_watch_task
         except asyncio.CancelledError:
             pass
 

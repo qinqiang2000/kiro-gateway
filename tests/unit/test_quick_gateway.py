@@ -591,3 +591,146 @@ class TestImageBlock:
         out = anthropic_to_converse(payload)
         content = out["messages"][0]["content"]
         assert not any("image" in b for b in content)  # bad base64 dropped
+
+
+# ==================================================================================================
+# Model watch (public remote-config registry)
+# ==================================================================================================
+
+_SAMPLE_CONFIG = {
+    "config_version": 0,
+    "models": {
+        "default": {
+            "fast": {"model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+            "smart": {"model_id": "us.anthropic.claude-opus-4-6-v1"},
+        }
+    },
+    "config-priority-rule-list": [
+        {
+            "condition": {"regions": ["us-west-2"]},
+            "configs": [
+                {"percentage": 50, "controlVariant": True,
+                 "value": {"models": {"default": {"smart": {"model_id": "us.anthropic.claude-opus-4-8"}}}}},
+                {"percentage": 50,
+                 "value": {"models": {"default": {"smart": {"model_id": "us.anthropic.claude-opus-5"}}}}},
+            ],
+        },
+        {"condition": {}, "configs": [{"percentage": 100, "value": {"quotas": {"a": 1}}}]},
+    ],
+}
+
+
+class TestModelWatchSuccess:
+    """extract_mapping / diff_mapping over the public Quick remote config."""
+
+    def test_extract_mapping_covers_base_and_rollout_variants(self):
+        from quick.model_watch import extract_mapping
+
+        mapping = extract_mapping(_SAMPLE_CONFIG)
+
+        assert mapping["base/default/smart"] == "us.anthropic.claude-opus-4-6-v1"
+        # Each rollout bucket is its own scope, so a canary stays visible.
+        assert "us.anthropic.claude-opus-5" in mapping.values()
+        assert sum(1 for v in mapping.values() if v == "us.anthropic.claude-opus-4-8") == 1
+
+    def test_extract_mapping_ignores_configs_without_models(self):
+        from quick.model_watch import extract_mapping
+
+        mapping = extract_mapping(_SAMPLE_CONFIG)
+
+        assert not any(k.startswith("rule1") for k in mapping)
+
+    def test_diff_reports_new_model_ids_and_changed_modes(self):
+        from quick.model_watch import diff_mapping
+
+        previous = {"base/default/smart": "us.anthropic.claude-opus-4-6-v1"}
+        current = {"base/default/smart": "us.anthropic.claude-opus-5"}
+
+        report = diff_mapping(previous, current)
+
+        assert report["new_models"] == ["us.anthropic.claude-opus-5"]
+        assert report["changed"]["base/default/smart"] == [
+            "us.anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-5",
+        ]
+        assert "us.anthropic.claude-opus-5" in report["unknown_to_gateway"]
+
+    def test_diff_of_identical_mappings_is_empty(self):
+        from quick.model_watch import diff_mapping
+
+        mapping = {"base/default/smart": "us.anthropic.claude-opus-4-8"}
+
+        report = diff_mapping(mapping, dict(mapping))
+
+        assert not report["new_models"]
+        assert not report["changed"]
+        assert not report["added"] and not report["removed"]
+        # opus-4-8 is a known gateway model, so nothing is flagged as unknown.
+        assert report["unknown_to_gateway"] == []
+
+
+class TestModelRankSuccess:
+    """Version/family ranking that decides what counts as an upgrade."""
+
+    @pytest.mark.parametrize("model_id,expected", [
+        ("us.anthropic.claude-opus-4-8", (2, (4, 8))),
+        ("us.anthropic.claude-opus-5", (2, (5, 0))),
+        ("global.anthropic.claude-haiku-4-5-20251001-v1:0", (0, (4, 5))),
+        ("us.anthropic.claude-sonnet-4-6", (1, (4, 6))),
+    ])
+    def test_rank_parses_family_and_version(self, model_id, expected):
+        from quick.model_watch import model_rank
+
+        assert model_rank(model_id) == expected
+
+    def test_rank_of_non_claude_id_is_none(self):
+        from quick.model_watch import model_rank
+
+        assert model_rank("us.amazon.nova-lite-v1:0") is None
+
+    @pytest.mark.parametrize("candidate,expected", [
+        ("us.anthropic.claude-opus-5", True),         # newer Opus wins
+        ("us.anthropic.claude-opus-4-10", True),      # minor compared numerically, not as text
+        ("us.anthropic.claude-opus-4-6-v1", False),   # older Opus
+        ("us.anthropic.claude-sonnet-5", False),      # newer but weaker family
+        ("us.amazon.nova-lite-v1:0", False),          # unparsable
+    ])
+    def test_is_upgrade_against_opus_4_8(self, candidate, expected):
+        from quick.model_watch import is_upgrade
+
+        assert is_upgrade(candidate, "us.anthropic.claude-opus-4-8") is expected
+
+
+class TestAlertFormatting:
+    """What gets pushed to chat, and how short it is."""
+
+    def test_upgrade_message_is_three_short_lines(self):
+        from quick.model_watch import format_alert
+
+        report = {"upgrades": ["us.anthropic.claude-opus-5"],
+                  "new_models": ["us.anthropic.claude-opus-5"],
+                  "baseline": "us.anthropic.claude-opus-4-8",
+                  "all_models": ["us.anthropic.claude-opus-5"]}
+        mapping = {"rule0[regions=us-west-2]/cfg0(50%)/default/smart": "us.anthropic.claude-opus-5",
+                   "rule0[regions=us-west-2]/cfg0(50%)/default/smart.thinking": "us.anthropic.claude-opus-5"}
+
+        text = format_alert(report, mapping)
+
+        assert text.startswith("🚀")
+        assert len(text.splitlines()) == 3  # one location only — the rest is noise
+        assert "--probe us.anthropic.claude-opus-5" in text
+
+    def test_only_an_opus_class_upgrade_is_pushed(self):
+        from quick.model_watch import should_alert
+
+        # A newer Sonnet while the baseline is Opus: logged, not pushed.
+        assert should_alert({"upgrades": [], "new_models": ["us.anthropic.claude-sonnet-5"]}) is False
+        assert should_alert({"upgrades": [], "changed": {"base/default/smart": ["a", "b"]}}) is False
+        assert should_alert({"upgrades": ["us.anthropic.claude-opus-5"]}) is True
+
+    def test_long_region_lists_are_compressed_in_chat_only(self):
+        from quick.model_watch import _short_scope
+
+        scope = "rule1[regions=us-west-2,eu-west-1,eu-central-1,eu-west-2]/cfg1(50%)/default/smart"
+
+        assert _short_scope(scope) == "rule1[regions=us-west-2+3]/cfg1(50%)/default/smart"

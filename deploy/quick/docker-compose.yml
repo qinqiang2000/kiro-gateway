@@ -29,6 +29,11 @@ services:
       - QUICK_CREDS_FILE=/home/kiro/.quickwork/gateway-creds.json
       # Force every request to the best authorized Opus (opus-5 is IAM-denied).
       - QUICK_FORCE_MODEL=us.anthropic.claude-opus-4-8
+      # Model watch: poll Quick's PUBLIC model registry hourly and alert on a newer
+      # model. The webhook URL is a secret -> keep it in /opt/quick-gateway/.env
+      # (docker compose reads that file automatically); never commit it here.
+      - QUICK_MODEL_WATCH_INTERVAL=3600
+      - QUICK_ALERT_WEBHOOK=${QUICK_ALERT_WEBHOOK:-}
     volumes:
       - ./quickwork:/home/kiro/.quickwork
     restart: unless-stopped

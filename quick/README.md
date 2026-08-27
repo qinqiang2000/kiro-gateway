@@ -155,6 +155,83 @@ list and is *not* served by this gateway.
 Backend failures arrive as an in-stream `{"eventType":"error"}` frame under HTTP
 200; the gateway surfaces these as real errors (403 for IAM denies, else 502).
 
+### Detecting a new model (`model_watch.py`)
+
+Quick publishes its **model registry in a public, unauthenticated CloudFront config**
+that the desktop app polls every ~60 s:
+
+```
+https://d2tws6r933zatt.cloudfront.net/quickwork/prod/feature_flag_config.json
+```
+
+It holds the mode→model map (`fast` / `balanced` / `smart`, each with a `.thinking`
+variant) for the base config *and* every staged-rollout override — per region, per
+percentage bucket. A new Claude model appears here (typically as a regional
+percentage canary) before it is worth spending a single inference request. As of
+2026-08-27 it already carries `us.anthropic.claude-sonnet-5` in a 50 % bucket for
+us-west-2 / eu-* / ap-southeast-2, while `smart` is `opus-4-8` there and
+`opus-4-6-v1` in the base config.
+
+So detection is two-stage, and stage 1 never touches the tenant DataPlane:
+
+```bash
+python -m quick.model_watch            # conditional GET + diff vs saved state
+python -m quick.model_watch --json     # machine-readable report
+```
+
+Exit code `10` = something changed (cron-friendly); state and ETag live in
+`~/.quickwork/model-watch-state.json` (`QUICK_MODEL_WATCH_STATE`). Hourly polling is
+1/60 of the app's own rate against a CDN object with no credentials attached, so it
+cannot trip inference-side rate limiting.
+
+The gateway also runs this on a timer itself: `main.py`'s lifespan starts
+`watch_loop()` every `QUICK_MODEL_WATCH_INTERVAL` seconds (default 3600, `0` disables).
+Every change is logged at WARNING, but **only an upgrade is pushed** to the chat robot
+(`POST {"content": "…"}`) — three lines, no config dump:
+
+```
+🚀 Quick 新模型：us.anthropic.claude-opus-5（基线 us.anthropic.claude-opus-4-8）
+位置：rule1[regions=us-west-2+4]/cfg1(50%)/default/smart
+确认权限：python -m quick.model_watch --probe us.anthropic.claude-opus-5
+```
+
+An id counts as an **upgrade** when its family is at least as strong *as the baseline*
+and its version is newer — i.e. "a new Opus-class version" when the baseline is Opus.
+`opus-5` beats `opus-4-8`; `sonnet-5` does not, so it is logged and not pushed. Mode
+remaps and retired ids are log-only too.
+
+| env | meaning |
+|-----|---------|
+| `QUICK_MODEL_WATCH_INTERVAL` | poll interval in seconds; `0` = off (default 3600) |
+| `QUICK_ALERT_WEBHOOK` | chat webhook URL; empty = log only. **Secret — `.env` only, this repo is public** |
+| `QUICK_UPGRADE_BASELINE` | the model an alert must beat; defaults to `QUICK_FORCE_MODEL` |
+| `QUICK_ALERT_ALL_CHANGES` | `1` to also push non-upgrade changes (noisy; off by default) |
+
+If a push fails the state is not saved, so the next cycle re-detects and retries rather
+than losing the alert.
+
+```bash
+python -m quick.model_watch --test-notify   # verify the webhook
+```
+
+Stage 2 confirms whether *this account* may use a newly seen id — one 1-token
+`ConverseStream`, run manually, not on a timer:
+
+```bash
+python -m quick.model_watch --probe us.anthropic.claude-opus-5
+# → available | denied | unknown_model | error
+```
+
+`denied` (IAM explicit deny) means the model exists but the account is not entitled —
+recheck occasionally; `unknown_model` (validation error) means the id is not live at
+all — stop trying it.
+
+> **Run `--probe` on the host that owns the credentials** (i.e. inside the deployed
+> container), never on the mac while the Linux gateway is live: any auth path here
+> refreshes Keycloak and rotates the `refresh_token`, which invalidates the copy the
+> other host is using. `--probe` needs creds; the plain watch does not.
+
+
 ## Thinking (extended reasoning)
 
 Quick's models use **adaptive** thinking with an effort level (the app's

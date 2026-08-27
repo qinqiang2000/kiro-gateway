@@ -67,7 +67,49 @@ litellm only reads these on restart; verify with
 `curl -s localhost:4000/v1/model/info -H "Authorization: Bearer <master-key>"` and by
 checking `spend` on the next `LiteLLM_SpendLogs` row.
 
-## 6. Trouble
+## 6. Watch for a newer model
+
+Quick's model registry is a **public CloudFront JSON** (no auth, no DataPlane traffic) —
+diff it instead of probing inference. Exit code 10 = changed:
+
+```bash
+python -m quick.model_watch            # or --json for a machine-readable report
+# on the box:
+docker compose -p quick-gateway exec quick-gateway python -m quick.model_watch
+```
+
+**The gateway already does this on a timer** — `main.py` starts `watch_loop()` every
+`QUICK_MODEL_WATCH_INTERVAL` s (default 3600). Every change is logged at WARNING;
+only an **upgrade** (a newer Opus-class model, i.e. one beating `QUICK_UPGRADE_BASELINE`)
+is pushed to the chat robot, in three lines, when `QUICK_ALERT_WEBHOOK` is set
+(`QUICK_ALERT_ALL_CHANGES=1` pushes everything — noisy). The webhook is a secret and **this repo
+is public**, so it lives in the box's compose `.env`, not in git — one-time setup:
+
+```bash
+ssh rocky@43.160.157.90 'cat >> /opt/quick-gateway/.env' <<'EOF'
+QUICK_ALERT_WEBHOOK=https://www.yunzhijia.com/gateway/robot/webhook/send?yzjtype=0&yzjtoken=<token>
+EOF
+cd /opt/quick-gateway && docker compose -p quick-gateway up -d      # picks it up
+docker compose -p quick-gateway exec quick-gateway python -m quick.model_watch --test-notify
+```
+
+`deploy/quick/docker-compose.yml` passes it through as `${QUICK_ALERT_WEBHOOK:-}`, and
+`quick/deploy.sh` never copies `.env`, so the box's file survives redeploys. No cron
+needed — run the CLI by hand only for an ad-hoc check.
+
+When a new id shows up, confirm account access with **one** request — from the box
+only (running auth on the mac rotates the refresh_token and breaks the box's copy):
+
+```bash
+docker compose -p quick-gateway exec quick-gateway \
+  python -m quick.model_watch --probe us.anthropic.claude-opus-5   # available|denied|unknown_model
+```
+
+`available` → set `QUICK_FORCE_MODEL` to it in the compose and restart; also add it to
+`QUICK_MODELS` in `quick/config.py`, and add a litellm entry if it is fronted there (§5).
+Background: `quick/README.md` → "Detecting a new model".
+
+## 7. Trouble
 
 - Startup "No Kiro credentials" → set `REFRESH_TOKEN` (any value) in the compose.
 - "No Quick credentials: cache file absent" (Linux) → creds not copied / not owned by 999.
