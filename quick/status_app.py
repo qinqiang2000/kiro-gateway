@@ -12,18 +12,25 @@ account e-mail — only the labels derived from credential *filenames*, plus the
 quota numbers Quick reports. Name the files neutrally (``b``, ``c``) if the page
 is public and the humans behind the accounts should not be.
 
-Set :data:`quick.config.QUICK_STATUS_TOKEN` to require ``?t=<token>`` (or an
-``X-Status-Token`` header); leave it empty for an open page.
+The page lives under :data:`quick.config.QUICK_STATUS_PATH` (default ``/quick``) and
+everything else 404s, so a scanner sweeping ``/`` finds nothing. That is obscurity,
+not a boundary — set :data:`quick.config.QUICK_STATUS_TOKEN` to require
+``?t=<token>`` (or an ``X-Status-Token`` header) if the page should be private.
 """
 
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from loguru import logger
 
 from quick import config as quick_config
-from quick.config import QUICK_STATUS_HOST, QUICK_STATUS_PORT, QUICK_STATUS_TOKEN
+from quick.config import (
+    QUICK_STATUS_HOST,
+    QUICK_STATUS_PATH,
+    QUICK_STATUS_PORT,
+    QUICK_STATUS_TOKEN,
+)
 from quick.pool import pool
 
 PAGE = """<!DOCTYPE html>
@@ -149,7 +156,9 @@ function esc(s) {
 
 async function tick() {
   try {
-    const r = await fetch("api/pool" + location.search, {cache: "no-store"});
+    let base = location.pathname;                 // works under any status path
+    while (base.endsWith("/")) base = base.slice(0, -1);
+    const r = await fetch(base + "/api/pool" + location.search, {cache: "no-store"});
     if (!r.ok) throw new Error(r.status);
     render(await r.json());
   } catch (e) {
@@ -172,29 +181,45 @@ def _authorized(request: Request) -> bool:
     return supplied == QUICK_STATUS_TOKEN
 
 
-def create_status_app() -> FastAPI:
-    """Build the status-only ASGI app (no inference routes, by construction)."""
-    app = FastAPI(title="Quick Pool Status", docs_url=None, redoc_url=None, openapi_url=None)
+def status_prefix(raw: Optional[str] = None) -> str:
+    """Normalize the configured status path to ``/thing`` (or ``""`` for the root)."""
+    value = (QUICK_STATUS_PATH if raw is None else raw).strip().strip("/")
+    return f"/{value}" if value else ""
 
-    @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> Any:
+
+def create_status_app(path: Optional[str] = None) -> FastAPI:
+    """Build the status-only ASGI app (no inference routes, by construction).
+
+    Args:
+        path: Serve under this path instead of :data:`quick.config.QUICK_STATUS_PATH`.
+    """
+    app = FastAPI(title="Quick Pool Status", docs_url=None, redoc_url=None, openapi_url=None)
+    prefix = status_prefix(path)
+
+    async def _index(request: Request) -> Any:
         """The page itself."""
         if not _authorized(request):
-            return HTMLResponse("Not found", status_code=404)
+            return HTMLResponse("Not Found", status_code=404)
         return HTMLResponse(PAGE, headers={"Cache-Control": "no-store"})
 
-    @app.get("/api/pool")
-    async def api_pool(request: Request) -> Any:
+    async def _api_pool(request: Request) -> Any:
         """Per-account quota, as JSON. Carries no credential material."""
         if not _authorized(request):
             return JSONResponse({"error": "not found"}, status_code=404)
         pool.discover()
         return JSONResponse(pool.snapshot(), headers={"Cache-Control": "no-store"})
 
-    @app.get("/health")
-    async def health() -> Any:
-        """Liveness probe."""
-        return JSONResponse({"status": "ok"})
+    # Both with and without the trailing slash; the page's fetch() derives the API
+    # URL from its own pathname, so either entry point works.
+    app.add_api_route(prefix or "/", _index, methods=["GET"], response_class=HTMLResponse)
+    if prefix:
+        app.add_api_route(f"{prefix}/", _index, methods=["GET"], response_class=HTMLResponse)
+    app.add_api_route(f"{prefix}/api/pool", _api_pool, methods=["GET"])
+
+    @app.exception_handler(404)
+    async def _not_found(request: Request, exc: Any) -> Any:
+        """Answer every other path with a bare 404 — nothing to fingerprint."""
+        return PlainTextResponse("Not Found", status_code=404)
 
     return app
 
@@ -234,8 +259,8 @@ async def serve_status_page(
     # raises outright when the loop is not on the main thread).
     server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
     logger.info(
-        "Quick pool status page on http://{}:{}/ ({}).",
-        config.host, bind_port,
+        "Quick pool status page on http://{}:{}{} ({}).",
+        config.host, bind_port, status_prefix() or "/",
         "token required" if QUICK_STATUS_TOKEN else "public, read-only",
     )
     try:

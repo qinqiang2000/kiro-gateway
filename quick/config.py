@@ -99,6 +99,11 @@ QUICK_POOL_MAX_ATTEMPTS: int = int(os.getenv("QUICK_POOL_MAX_ATTEMPTS", "2"))
 QUICK_STATUS_PORT: int = int(os.getenv("QUICK_STATUS_PORT", "9090"))
 QUICK_STATUS_HOST: str = os.getenv("QUICK_STATUS_HOST", "0.0.0.0")
 
+# Path the page is served under. Everything outside it 404s, so a scanner sweeping
+# ``/`` finds nothing — cheap obscurity, not a security boundary (use
+# QUICK_STATUS_TOKEN for that). Empty string serves at the root.
+QUICK_STATUS_PATH: str = os.getenv("QUICK_STATUS_PATH", "/quick")
+
 # Optional shared secret. Empty (default) = the page is public. When set, requests
 # must carry ?t=<token> or the X-Status-Token header.
 QUICK_STATUS_TOKEN: str = os.getenv("QUICK_STATUS_TOKEN", "")

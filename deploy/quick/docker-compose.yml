@@ -20,7 +20,7 @@ services:
     container_name: quick-gateway
     ports:
       - "127.0.0.1:8000:8000"   # inference: localhost-only; in-cluster as quick-gateway:8000
-      - "9090:9090"             # status page ONLY (read-only quota view), public on purpose
+      - "9090:9090"             # status page ONLY (read-only quota view at /quick), public
     environment:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
@@ -54,6 +54,9 @@ services:
       # while 8000 stays bound to localhost. Set QUICK_STATUS_TOKEN in .env to gate it.
       - QUICK_STATUS_PORT=9090
       - QUICK_STATUS_HOST=0.0.0.0
+      # Served under this path only; every other path 404s, so a scanner sweeping
+      # "/" finds nothing. Obscurity, not a boundary — QUICK_STATUS_TOKEN is that.
+      - QUICK_STATUS_PATH=/quick
       - QUICK_STATUS_TOKEN=${QUICK_STATUS_TOKEN:-}
     volumes:
       - ./quickwork:/home/kiro/.quickwork

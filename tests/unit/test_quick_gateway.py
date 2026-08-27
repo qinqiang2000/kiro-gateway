@@ -1284,4 +1284,21 @@ class TestStatusPageSafety:
 
         paths = {r.path for r in create_status_app().routes}
 
-        assert paths == {"/", "/api/pool", "/health"}
+        assert paths == {"/quick", "/quick/", "/quick/api/pool"}
+
+    def test_everything_outside_the_prefix_is_404(self):
+        from fastapi.testclient import TestClient
+        from quick.status_app import create_status_app
+
+        client = TestClient(create_status_app())
+
+        assert client.get("/").status_code == 404
+        assert client.get("/api/pool").status_code == 404
+        assert client.get("/quick").status_code == 200
+
+    def test_prefix_is_configurable(self):
+        from quick.status_app import create_status_app
+
+        paths = {r.path for r in create_status_app("/pool-abc").routes}
+
+        assert paths == {"/pool-abc", "/pool-abc/", "/pool-abc/api/pool"}

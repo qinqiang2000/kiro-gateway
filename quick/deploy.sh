@@ -130,4 +130,4 @@ ssh "${SSH_OPTS[@]}" "$REMOTE" '
   | python3 -c "import sys,json; print(\"  →\", json.load(sys.stdin)[\"content\"][0][\"text\"])" \
   || echo "  冒烟测试失败，检查 docker logs quick-gateway"
 '
-say "完成 ✅   状态页: http://${HOST}:9090/"
+say "完成 ✅   状态页: http://${HOST}:9090/quick"

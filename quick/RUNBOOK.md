@@ -7,7 +7,7 @@ Anthropic-compatible `POST /quick/v1/messages` → Amazon Quick (Bedrock Convers
 Coexists with the Kiro routes in the same server. Auth = portable files
 `~/.quickwork/gateway-creds*.json`, **one per account** — the gateway pools them and
 picks the account with the most quota left (`quick/pool.py`). Live status:
-<http://43.160.157.90:9090/>.
+<http://43.160.157.90:9090/quick>.
 
 ## 1. Get a creds file (once per account, on a mac signed into Amazon Quick)
 
@@ -81,10 +81,12 @@ Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:90
 
 ## 5. The status page (port 9090, public)
 
-<http://43.160.157.90:9090/> — one card per account: session allowance left, monthly
+<http://43.160.157.90:9090/quick> — one card per account: session allowance left, monthly
 used, ready/cooling/disabled, cooldown countdown. Auto-refreshes every 20 s. It is a
 **separate app on a separate port** (`quick/status_app.py`) with no inference route, so
-publishing it does not expose `/quick/v1/messages`. It shows no credential material —
+publishing it does not expose `/quick/v1/messages`. It is served **only** under
+`QUICK_STATUS_PATH` (default `/quick`) — every other path, `/` included, returns a bare
+404, so a scanner sweeping the port finds nothing. It shows no credential material —
 only the labels derived from filenames, so keep filenames neutral (`b`, `c`) rather than people's names.
 
 ```bash
@@ -92,8 +94,8 @@ curl -s localhost:8000/quick/pool | python3 -m json.tool   # same data, on the b
 docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --pool
 ```
 
-Gate it with `QUICK_STATUS_TOKEN=<secret>` in `/opt/quick-gateway/.env` (then
-`?t=<secret>`), or turn it off with `QUICK_STATUS_PORT=0`.
+The path is obscurity, not a boundary: gate it with `QUICK_STATUS_TOKEN=<secret>` in
+`/opt/quick-gateway/.env` (then `?t=<secret>`), or turn it off with `QUICK_STATUS_PORT=0`.
 
 ## 6. Optional: behind litellm
 

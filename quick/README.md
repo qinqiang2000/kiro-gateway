@@ -167,16 +167,24 @@ python -m quick.usage_watch --account b --json    # one account
 ## Status page (`status_app.py`)
 
 A read-only page showing each account's remaining quota, served on
-`QUICK_STATUS_PORT` (default 9090) — **a separate ASGI app on a separate port**, and
-that is the point: publishing the gateway's own port would expose
-`/quick/v1/messages`, i.e. hand the pool's quota to the internet. This app has three
-routes (`/`, `/api/pool`, `/health`) and no inference path.
+`QUICK_STATUS_PORT` (default 9090) under `QUICK_STATUS_PATH` (default `/quick`) —
+**a separate ASGI app on a separate port**, and that is the point: publishing the
+gateway's own port would expose `/quick/v1/messages`, i.e. hand the pool's quota to
+the internet. This app has two routes (the page and its `…/api/pool`) and no
+inference path; **everything else answers a bare 404**, so a scanner sweeping `/`
+finds nothing. That is obscurity, not a boundary — `QUICK_STATUS_TOKEN` is the
+boundary.
 
 It renders no credential material — no token, tenant URL, user ARN or e-mail, only
 the labels derived from *filenames* plus Quick's own numbers. Name the files
 neutrally (`b`, `c`) if the page is public and the humans behind the accounts should
 not be. Set `QUICK_STATUS_TOKEN` to require `?t=<token>`; leave it empty for an open
 page. `QUICK_STATUS_PORT=0` disables the server.
+
+```
+http://<box>:9090/quick            # the page
+http://<box>:9090/quick/api/pool   # the same data as JSON
+```
 
 ## Confirmed protocol
 
