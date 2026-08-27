@@ -191,6 +191,10 @@ def model_rank(model_id: str) -> Optional[Tuple[int, Tuple[int, int]]]:
     if not match:
         return None
     family, major, minor = match.group(1), match.group(2), match.group(3)
+    # A 4+ digit trailing group is a date stamp (claude-opus-5-20260901-v1:0), not a
+    # minor version — reading it as one would rank a dated x.0 above a real x.1.
+    if minor and len(minor) >= 4:
+        minor = None
     return _FAMILY_RANK[family], (int(major), int(minor or 0))
 
 

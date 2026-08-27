@@ -677,6 +677,10 @@ class TestModelRankSuccess:
         ("us.anthropic.claude-opus-5", (2, (5, 0))),
         ("global.anthropic.claude-haiku-4-5-20251001-v1:0", (0, (4, 5))),
         ("us.anthropic.claude-sonnet-4-6", (1, (4, 6))),
+        ("us.anthropic.claude-opus-5-1", (2, (5, 1))),
+        ("us.anthropic.claude-opus-5-v1", (2, (5, 0))),
+        # A trailing date stamp is not a minor version.
+        ("us.anthropic.claude-opus-5-20260901-v1:0", (2, (5, 0))),
     ])
     def test_rank_parses_family_and_version(self, model_id, expected):
         from quick.model_watch import model_rank
@@ -699,6 +703,19 @@ class TestModelRankSuccess:
         from quick.model_watch import is_upgrade
 
         assert is_upgrade(candidate, "us.anthropic.claude-opus-4-8") is expected
+
+    @pytest.mark.parametrize("baseline,candidate,expected", [
+        ("us.anthropic.claude-opus-5", "us.anthropic.claude-opus-5-1", True),
+        ("us.anthropic.claude-opus-5-1", "us.anthropic.claude-opus-5-2", True),
+        ("us.anthropic.claude-opus-5-2", "us.anthropic.claude-opus-5-10", True),
+        ("us.anthropic.claude-opus-5-2", "us.anthropic.claude-opus-5-1", False),
+        # A dated baseline must not swallow a real minor bump.
+        ("us.anthropic.claude-opus-5-20260901-v1:0", "us.anthropic.claude-opus-5-1", True),
+    ])
+    def test_minor_versions_chain_forward(self, baseline, candidate, expected):
+        from quick.model_watch import is_upgrade
+
+        assert is_upgrade(candidate, baseline) is expected
 
 
 class TestAlertFormatting:
