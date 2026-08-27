@@ -58,8 +58,22 @@ refresh_token 每次刷新都会**轮换**。两台机器用同一份 creds 文�
 refresh_token 作废。所以网关只在**一台**主机跑；重拷 creds 的时机是：offline token 彻底过期
 （~90 天无流量），或在 Mac 上重新登录了 Quick。
 
-## 5.（规划中）多账号 / 多密钥
+## 5. 多账号（账号池，已上线 2026-08-27）
 
-模仿 `kiro-gateway-N` + `kiro-nginx`：每个 Quick 账号一份自己的 `gateway-creds.json`、一个
-`quick-gateway-N` 容器，前面加 `quick-nginx` 做负载均衡，litellm 的 `claude-opus-quick` 指向
-`quick-nginx`。当前单容器即将来的 `quick-gateway-1`。（目前仅 1 个账号，暂缓。）
+**没有**照搬 `kiro-gateway-N` + `kiro-nginx`：Quick 每次响应都白送 `usageSummary`（该账号
+剩余额度），所以网关自己就能按剩余额度选账号，而 nginx 看不见配额——那正是 kiro 那套最后
+退化成"人肉注释 upstream"的原因。
+
+一个容器，`quickwork/` 下每个 `gateway-creds*.json` 就是一个账号（文件名即账号名：
+`gateway-creds.json`→`default`，`gateway-creds-b.json`→`b`）。**加账号 = 多放一个文件 + 重启**，
+不动 nginx、不动 litellm。
+
+- 选路：按会话剩余额度（按 10% 分桶）排序 → 在途请求数 → 已服务次数（同桶内轮询）。
+- 失败自动换账号重试（配额/限流/凭证/后端错误）；400 这类请求本身有问题的**不换**。
+- 固定绑定：`POST /quick/pin/{account}/v1/messages`（保底额度 / 调试用）。
+- 状态页：<http://43.160.157.90:9090/>（只读、外网可见、无凭证信息）。
+
+细节见 `quick/README.md` 的 "Account pool" 一节；日常操作见 `quick/RUNBOOK.md` §1/§3/§5。
+
+> ⚠️ 上传凭证必须点名账号：`./quick/deploy.sh --creds b`。默认的 `./quick/deploy.sh` **不动凭证**——
+> 容器一直在轮换并回写每个账号的文件，把 Mac 上那份旧副本盖回去等于弄死这个账号。
