@@ -58,6 +58,14 @@ quick-gateway is Anthropic-compatible. Add to litellm `config.yaml` (back it up 
 `model_name: claude-opus-quick` → `docker restart litellm`. (Container must share
 litellm's docker network.)
 
+**Cost tracking**: Quick is a flat-rate account, so price it at **1/10 of Anthropic's
+official Opus 4.8 list price** ($5 / $25 per MTok) — `input_cost_per_token: 5.0e-07`,
+`output_cost_per_token: 2.5e-06`. Note the box's own `claude-opus-4-8` entry uses an
+internal rate (`1.5e-05` / `7.5e-05`, 3x list) — do **not** derive the quick price from it.
+litellm only reads these on restart; verify with
+`curl -s localhost:4000/v1/model/info -H "Authorization: Bearer <master-key>"` and by
+checking `spend` on the next `LiteLLM_SpendLogs` row.
+
 ## 6. Trouble
 
 - Startup "No Kiro credentials" → set `REFRESH_TOKEN` (any value) in the compose.
