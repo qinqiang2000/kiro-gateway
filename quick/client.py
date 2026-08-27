@@ -19,13 +19,16 @@ non-streaming responses.
 """
 
 import json
-from typing import AsyncGenerator, Dict, Tuple
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, Optional, Tuple
 
 import httpx
 from loguru import logger
 
 from quick.auth import quick_auth_manager
 from quick.config import BEDROCK_PROXY_STREAM_PATH, EVENTSTREAM_ACCEPT
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from quick.pool import Account
 
 JsonDict = Dict[str, object]
 
@@ -39,9 +42,15 @@ class QuickAPIError(Exception):
         self.message = message
 
 
-async def _auth() -> Tuple[Dict[str, str], str]:
-    """Return (headers, tenant_base_url) for a DataPlane request."""
-    creds = await quick_auth_manager.get_credentials()
+async def _auth(account: Optional["Account"] = None) -> Tuple[Dict[str, str], str]:
+    """Return (headers, tenant_base_url) for a DataPlane request.
+
+    Args:
+        account: Pool account whose credentials to use. ``None`` falls back to the
+            process-wide manager (single-account deployments, CLI probes, tests).
+    """
+    manager = account.auth if account is not None else quick_auth_manager
+    creds = await manager.get_credentials()
     headers = {
         "Authorization": f"Bearer {creds.id_token}",
         "Content-Type": "application/json",
@@ -67,12 +76,16 @@ def _envelope(converse_input: JsonDict) -> bytes:
     return json.dumps(envelope, ensure_ascii=False).encode("utf-8")
 
 
-async def converse_stream(converse_input: JsonDict) -> AsyncGenerator[bytes, None]:
+async def converse_stream(
+    converse_input: JsonDict, account: Optional["Account"] = None
+) -> AsyncGenerator[bytes, None]:
     """POST a ConverseStream request and yield raw event-stream bytes.
 
     Args:
         converse_input: Bedrock ``Converse`` input incl. ``modelId`` (from
             :func:`quick.converters.anthropic_to_converse`).
+        account: Pool account to authenticate as; ``None`` uses the process-wide
+            credentials.
 
     Yields:
         Raw ``application/vnd.amazon.eventstream`` byte chunks.
@@ -82,8 +95,9 @@ async def converse_stream(converse_input: JsonDict) -> AsyncGenerator[bytes, Non
         quick.auth.QuickAuthError: If credentials cannot be obtained.
     """
     body = _envelope(converse_input)
+    manager = account.auth if account is not None else quick_auth_manager
     for attempt in range(2):
-        headers, base = await _auth()
+        headers, base = await _auth(account)
         # Per repo gotcha: streaming needs a dedicated client per request.
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
             async with client.stream(
@@ -91,7 +105,7 @@ async def converse_stream(converse_input: JsonDict) -> AsyncGenerator[bytes, Non
             ) as resp:
                 if resp.status_code in (401, 403) and attempt == 0:
                     logger.warning("Quick DataPlane {} — refreshing token and retrying.", resp.status_code)
-                    await quick_auth_manager.invalidate()
+                    await manager.invalidate()
                     await resp.aread()
                     continue
                 if resp.status_code >= 400:

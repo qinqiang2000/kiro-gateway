@@ -6,7 +6,8 @@ built alongside the Kiro gateway and reusing its conventions. Exposes
 proxies Amazon Bedrock `Converse` / `ConverseStream`.
 
 **Status: fully working** — text, streaming, and tool-use verified end-to-end
-against the live backend.
+against the live backend, over a **pool of accounts** (quota-aware selection with
+failover) fronted by a public read-only quota page.
 
 ```
 Anthropic client ─▶ /quick/v1/messages ─▶ converters ─▶ quick.client ─▶ tenant DataPlane ─▶ Bedrock
@@ -43,8 +44,17 @@ scp ~/.quickwork/gateway-creds.json  user@linux-box:~/.quickwork/gateway-creds.j
 
 **Run the gateway on exactly one host.** Keycloak rotates the `refresh_token` on every
 refresh, so two hosts refreshing from copies of the same file will eventually invalidate
-each other. Re-copy only if the offline `refresh_token` fully lapses (~90 days) or you
-re-sign-in to Quick on the mac.
+each other. This is per *file*, so a multi-account pool on one host is fine — what is not
+fine is the same account's file living in two running places (two hosts, or the box plus
+a signed-in desktop app). Re-copy only if the offline `refresh_token` fully lapses
+(~90 days) or you re-sign-in to Quick on the mac.
+
+For a second account, export it into its own file (the pool picks it up by filename):
+
+```bash
+QUICK_PROFILE_ID=<new-profile-id> QUICK_CREDS_FILE=~/.quickwork/gateway-creds-b.json \
+  python -c "from quick.auth import QuickAuthManager; QuickAuthManager()._load()"
+```
 
 ### Docker (isolated deploy — the `deploy/quick/` compose)
 
@@ -53,12 +63,120 @@ port 8000, mounting `./quickwork` → `/home/kiro/.quickwork`. The image runs as
 (`kiro`), so the creds dir/file on the host must be owned by 999 for refresh to persist:
 
 ```bash
-mkdir -p quickwork && cp ~/.quickwork/gateway-creds.json quickwork/ && chown -R 999:999 quickwork
+mkdir -p quickwork && cp ~/.quickwork/gateway-creds*.json quickwork/ && chown -R 999:999 quickwork
 docker compose -p quick-gateway up -d --build
 ```
 
+Port `8000` (inference) stays bound to `127.0.0.1`; port `9090` (the status page)
+is published publicly on purpose.
+
 `REFRESH_TOKEN=dummy` in that compose only satisfies `main.py`'s startup credential check
 (the Kiro `/v1/*` routes are inert in this container); quick-gateway needs no Kiro creds.
+
+## Account pool (`pool.py`)
+
+Quick meters a **rolling session allowance plus a monthly entitlement per account**
+(per *user*, not per tenant — verified: two users on one tenant have independent
+buckets). So capacity scales by adding accounts, and the thing to schedule against
+is quota, not concurrency.
+
+Every credential file in `QUICK_CREDS_DIR` matching `gateway-creds*.json` is one
+pool member; the account name comes from the filename:
+
+| file | account |
+|------|---------|
+| `gateway-creds.json` | `default` |
+| `gateway-creds-b.json` | `b` |
+
+**Adding an account is: drop one more file in and restart.** No extra container, no
+load-balancer config. (Contrast the Kiro pool next door: one container per account
+behind an nginx `least_conn` upstream, where a dead account is discovered by a 502
+and fixed by hand-commenting a line.)
+
+### How an account is chosen
+
+Selection is **per request** — Converse is stateless, the gateway sends the full
+transcript every time, and nothing here uses prompt caching, so switching accounts
+mid-conversation is invisible to the client. There is deliberately **no key→account
+pinning by default**: pinning starves one account while the others idle, and takes
+the key down with it.
+
+1. drop accounts that are disabled or cooling down;
+2. rank by remaining session share, **bucketed** to 10 % (`QUICK_POOL_QUOTA_BUCKET`) —
+   ranking on the raw percentage would ping-pong the choice on every reading;
+3. break ties by in-flight requests, then by requests served — round-robin within a
+   bucket, which also spreads the first requests before any reading exists.
+
+An unmeasured account counts as full, so a freshly added one gets the first request
+(which produces the reading that then ranks it honestly).
+
+### Failover
+
+A request that fails on quota, throttling, credential or backend grounds cools that
+account down and is **retried on the next candidate** (`QUICK_POOL_MAX_ATTEMPTS`,
+default 2). A malformed request (HTTP 400 / validation) is *not* retried — it would
+fail identically everywhere and just burn a second account's quota.
+
+Streaming holds back `message_start` until the first real event arrives, so a
+failover before the first token is invisible to the client; Quick's HTTP-200
+in-stream `error` frame is caught there too. Once bytes are on the wire the stream
+belongs to the client and the error is surfaced as-is.
+
+### What benches an account
+
+| condition | effect |
+|-----------|--------|
+| `entitlementStatus != ALLOWED` | cooldown (`QUICK_POOL_COOLDOWN_SECONDS`, default 15 min) |
+| session allowance at 0 % | cooldown until the window resets |
+| 429 / IAM deny / backend error | cooldown 5 min / 5 min / 1 min |
+| Keycloak `invalid_grant` on refresh | **disabled** + one alert — only a re-uploaded creds file fixes it |
+
+> `resumeInMinutes` is **not** a lockout timer — it counts down to the rolling
+> session window's reset and is populated while the account is perfectly usable
+> (verified live: 21 % left, `resumeInMinutes` 55, `entitlementStatus` ALLOWED). It
+> only sizes the cooldown once the allowance really is exhausted. A merely *low*
+> account needs no special case: selection already ranks it below its siblings.
+
+### Pinning (the escape hatch)
+
+`POST /quick/pin/{account}/v1/messages` serves the same API against one named
+account, with no failover — for reserved capacity or for debugging one account. In
+litellm, give it its own `model_name` (`api_base: …/quick/pin/b`) and grant that
+model only to the key that should be isolated.
+
+```bash
+curl localhost:8000/quick/pool                    # per-account quota, as JSON
+python -m quick.usage_watch --pool                # same, as a table
+python -m quick.usage_watch --account b --json    # one account
+```
+
+| env | meaning |
+|-----|---------|
+| `QUICK_CREDS_DIR` | directory scanned for credential files (default: `QUICK_CREDS_FILE`'s dir) |
+| `QUICK_ACCOUNTS` | explicit account list (`default,b`), overriding discovery |
+| `QUICK_POOL_MAX_ATTEMPTS` | accounts one request may try (default 2; 1 = no failover) |
+| `QUICK_POOL_COOLDOWN_SECONDS` | default cooldown when the backend gives no resume hint (900) |
+| `QUICK_POOL_QUOTA_BUCKET` | ranking bucket width in percent (10) |
+| `QUICK_POOL_AVOID_OVERAGE` | `1` to prefer accounts with monthly headroom over overage |
+
+> **One writer per credential file.** Keycloak rotates the refresh token on every
+> refresh, so the same file must never be refreshed from two places — that is why
+> `deploy.sh` only uploads accounts you name explicitly, and why the desktop app
+> should be signed out after a creds export.
+
+## Status page (`status_app.py`)
+
+A read-only page showing each account's remaining quota, served on
+`QUICK_STATUS_PORT` (default 9090) — **a separate ASGI app on a separate port**, and
+that is the point: publishing the gateway's own port would expose
+`/quick/v1/messages`, i.e. hand the pool's quota to the internet. This app has three
+routes (`/`, `/api/pool`, `/health`) and no inference path.
+
+It renders no credential material — no token, tenant URL, user ARN or e-mail, only
+the labels derived from *filenames* plus Quick's own numbers. Name the files
+neutrally (`b`, `c`) if the page is public and the humans behind the accounts should
+not be. Set `QUICK_STATUS_TOKEN` to require `?t=<token>`; leave it empty for an open
+page. `QUICK_STATUS_PORT=0` disables the server.
 
 ## Confirmed protocol
 
@@ -106,9 +224,11 @@ stream path and aggregates for non-streaming responses.
 | `client.py` | DataPlane HTTP client (envelope + id_token bearer + retry) |
 | `websearch.py` | key-less DuckDuckGo web search (executes `web_search` gateway-side) |
 | `model_watch.py` | watch the public model registry, alert on a newer Opus |
-| `usage_watch.py` | watch the session allowance, alert once when it runs low |
+| `usage_watch.py` | per-account allowance readings, alert once when one runs low |
+| `pool.py` | the account pool: discovery, quota-aware selection, cooldown/failover |
+| `status_app.py` | public read-only quota page (own port, no inference route) |
 | `agent_loop.py` | model↔web_search loop (Path B): run, search, feed back, repeat |
-| `routes.py` | FastAPI `/quick/v1/messages` |
+| `routes.py` | FastAPI `/quick/v1/messages`, `/quick/pin/{account}/…`, `/quick/pool` |
 
 ## Tools
 
@@ -256,10 +376,14 @@ frame carries a `usageSummary` sibling of the event payload (verified live):
 ```
 
 `usedPercentage` is the share **consumed**, so what matters for an alert is
-`100 - usedPercentage` — the share still available.
+`100 - usedPercentage` — the share still available. `resumeInMinutes` counts down to
+the session window's reset, *not* to the end of a lockout: it is set while the
+account is still usable (21 % left, `resumeInMinutes` 55, ALLOWED — verified live).
 
-So the watch is nearly free: `streaming.py` hands every wrapper frame to
-`observe_event()`, which keeps the newest reading in memory. `main.py`'s lifespan
+So the watch is nearly free: `streaming.py` hands every decoded frame to
+`observe_event()`, which keeps the newest reading in memory **per pool account**
+(the request path stamps the account it selected on a `ContextVar`, since the
+response itself never says which account it came from). `main.py`'s lifespan
 runs `watch_loop()` every `QUICK_SESSION_WATCH_INTERVAL` seconds (default 3600,
 `0` disables); a cycle spends **one 1-token request only if** the gateway has been
 idle longer than that interval and has nothing fresh to read.
@@ -280,10 +404,16 @@ share is back at or above the threshold (a new session window), so a long stretc
 `~/.quickwork/session-usage-state.json` (`QUICK_SESSION_WATCH_STATE`), so a restart
 does not re-fire. A failed push leaves the state armed and the next cycle retries.
 
+Each account gets its own edge-triggered alert, plus two pool-level ones: a
+credential that died (`invalid_grant` — only a re-upload fixes it), and **every
+account unusable**, which is the only alert that means *go add an account*.
+
 ```bash
-python -m quick.usage_watch           # current reading (probes if stale) - exit 10 = below threshold
-python -m quick.usage_watch --json    # machine-readable
-python -m quick.usage_watch --probe   # force a fresh 1-token probe
+python -m quick.usage_watch              # every account (probes the stale ones)
+python -m quick.usage_watch --pool       # the pool table only, no probing
+python -m quick.usage_watch --account b  # one account
+python -m quick.usage_watch --json       # machine-readable
+python -m quick.usage_watch --probe      # force a fresh 1-token probe
 # on the box:
 docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --json
 ```

@@ -570,6 +570,17 @@ async def lifespan(app: FastAPI):
     except Exception as _qmw_exc:  # noqa: BLE001 - Quick backend is optional
         logger.warning(f"Quick model watch task not started: {_qmw_exc}")
 
+    # --- Quick pool status page (optional, separate port) ---
+    # A read-only page showing each pool account's remaining quota. It runs as its
+    # OWN app on its own port so that exposing it cannot expose /quick/v1/messages.
+    quick_status_task = None
+    try:
+        from quick.status_app import serve_status_page as _quick_status_page
+
+        quick_status_task = asyncio.create_task(_quick_status_page())
+    except Exception as _qsp_exc:  # noqa: BLE001 - the page is optional
+        logger.warning(f"Quick status page not started: {_qsp_exc}")
+
     # --- Quick session-usage watch (optional) ---
     # Reads the entitlement snapshot Quick attaches to every inference response and
     # alerts once when the session allowance runs low. See quick/usage_watch.py.
@@ -608,6 +619,13 @@ async def lifespan(app: FastAPI):
         quick_usage_watch_task.cancel()
         try:
             await quick_usage_watch_task
+        except asyncio.CancelledError:
+            pass
+
+    if quick_status_task is not None:
+        quick_status_task.cancel()
+        try:
+            await quick_status_task
         except asyncio.CancelledError:
             pass
 

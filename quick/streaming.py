@@ -107,14 +107,18 @@ class EventStreamDecoder:
                     payload = json.loads(payload_bytes.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     payload = {"_raw": payload_bytes.decode("utf-8", "replace")}
-            events.append(
-                {
-                    "event_type": headers.get(":event-type"),
-                    "message_type": headers.get(":message-type"),
-                    "exception_type": headers.get(":exception-type"),
-                    "payload": payload,
-                }
-            )
+            event = {
+                "event_type": headers.get(":event-type"),
+                "message_type": headers.get(":message-type"),
+                "exception_type": headers.get(":exception-type"),
+                "payload": payload,
+            }
+            # Every frame passes through here exactly once, so this is where the
+            # account's entitlement snapshot (``usageSummary``, on ``metadata``
+            # frames) is harvested — attributed to whichever pool account the
+            # request path selected. See quick/usage_watch.py.
+            observe_event(event)
+            events.append(event)
         return events
 
 
@@ -152,9 +156,6 @@ def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
     """
     payload = event.get("payload") or {}
     if event.get("event_type") == "bedrockStreamEvent" and isinstance(payload, dict) and "eventType" in payload:
-        # The wrapper also carries the account's entitlement snapshot (``usageSummary``,
-        # on ``metadata`` frames) — hand it to the session watch before dropping it.
-        observe_event(event)
         inner = payload.get("payload") or {}
         etype = payload.get("eventType")
         # Surface errors and modeled exceptions carried inside the wrapper. Quick
@@ -164,6 +165,26 @@ def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
         return {"event_type": etype, "message_type": "event",
                 "exception_type": etype if is_err else None, "payload": inner}
     return event
+
+
+def backend_error(event: JsonDict) -> Optional[str]:
+    """Return the error text if a decoded frame is a backend failure, else ``None``.
+
+    Quick answers HTTP 200 even for failures (an IAM deny, an exhausted allowance)
+    by putting an ``{"eventType": "error"}`` frame in the stream. The pool needs to
+    see that *before* any SSE has been written to the client, so it can fail over to
+    another account instead of turning it into a user-visible error.
+
+    Args:
+        event: A decoded event from :class:`EventStreamDecoder`.
+
+    Returns:
+        The error message, or ``None`` for a normal event.
+    """
+    unwrapped = _unwrap_bedrock_event(event)
+    if unwrapped.get("exception_type"):
+        return _error_message(unwrapped.get("payload") or {})
+    return None
 
 
 def _error_message(payload: JsonDict) -> str:

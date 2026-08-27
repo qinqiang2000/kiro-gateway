@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -139,8 +140,12 @@ def _resolve_profile_id() -> str:
     return profile_id
 
 
-def _read_creds_file() -> Optional[dict]:
+def _read_creds_file(path: Optional[Path] = None) -> Optional[dict]:
     """Read the portable credential cache file, if present.
+
+    Args:
+        path: The cache file to read; defaults to :data:`QUICK_CREDS_FILE` (read at
+            call time so tests and the pool can redirect it).
 
     Returns:
         The parsed JSON blob, or ``None`` if the file does not exist.
@@ -149,13 +154,14 @@ def _read_creds_file() -> Optional[dict]:
         QuickAuthError: If the file exists but cannot be read or parsed (a corrupt
             cache should surface loudly, not silently fall back to the Keychain).
     """
-    if not QUICK_CREDS_FILE.exists():
+    path = path or QUICK_CREDS_FILE
+    if not path.exists():
         return None
     try:
-        return json.loads(QUICK_CREDS_FILE.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         raise QuickAuthError(
-            f"Quick credential cache {QUICK_CREDS_FILE} is unreadable/corrupt: {exc}. "
+            f"Quick credential cache {path} is unreadable/corrupt: {exc}. "
             f"Delete it to re-bootstrap from the Keychain (macOS), or re-copy it."
         ) from exc
 
@@ -192,12 +198,31 @@ def _read_keychain_blob(profile_id: str) -> dict:
 
 
 class QuickAuthManager:
-    """Manages Quick access tokens with automatic, thread-safe refresh."""
+    """Manages Quick access tokens with automatic, thread-safe refresh.
 
-    def __init__(self) -> None:
+    One instance owns exactly one credential file. In a multi-account deployment
+    (:mod:`quick.pool`) there is one manager per account, and each file is written
+    by that one manager only — Keycloak rotates the refresh token on every refresh,
+    so two writers on one file eventually invalidate each other.
+
+    Args:
+        creds_file: Credential cache to own. ``None`` (the default) resolves to
+            :data:`quick.config.QUICK_CREDS_FILE` at call time.
+        name: Account label used in logs; defaults to the file's derived name.
+    """
+
+    def __init__(self, creds_file: Optional[Path] = None, name: str = "") -> None:
         self._creds: Optional[QuickCredentials] = None
         self._lock = asyncio.Lock()
         self._profile_id: Optional[str] = None
+        self._creds_file: Optional[Path] = creds_file
+        self.name: str = name
+
+    @property
+    def creds_file(self) -> Path:
+        """The credential file this manager reads and writes."""
+        # Resolved lazily so monkeypatching quick.auth.QUICK_CREDS_FILE still works.
+        return self._creds_file or QUICK_CREDS_FILE
 
     def _load(self) -> QuickCredentials:
         """Load (or reload) credentials, file-first then Keychain.
@@ -214,15 +239,15 @@ class QuickAuthManager:
         Raises:
             QuickAuthError: If neither source yields usable credentials.
         """
-        blob = _read_creds_file()
+        blob = _read_creds_file(self.creds_file)
         source = "file"
         bootstrap_from_keychain = False
         if blob is None:
             if shutil.which("security") is None:
                 raise QuickAuthError(
-                    f"No Quick credentials: cache file {QUICK_CREDS_FILE} is absent and the "
+                    f"No Quick credentials: cache file {self.creds_file} is absent and the "
                     f"macOS `security` CLI is not available (are we on Linux?). Copy the file "
-                    f"from a signed-in mac: scp <mac>:{QUICK_CREDS_FILE} {QUICK_CREDS_FILE}"
+                    f"from a signed-in mac: scp <mac>:{self.creds_file} {self.creds_file}"
                 )
             self._profile_id = _resolve_profile_id()
             blob = _read_keychain_blob(self._profile_id)
@@ -241,7 +266,8 @@ class QuickAuthManager:
             self._save_creds_file(creds)
 
         logger.info(
-            "Loaded Quick credentials (source={}, profile={}, user={}, tenant={})",
+            "Loaded Quick credentials (account={}, source={}, profile={}, user={}, tenant={})",
+            self.name or "default",
             source,
             self._profile_id or "?",
             creds.user_arn or "?",
@@ -250,7 +276,7 @@ class QuickAuthManager:
         return creds
 
     def _save_creds_file(self, creds: QuickCredentials) -> None:
-        """Persist credentials to :data:`QUICK_CREDS_FILE` atomically, mode 0600.
+        """Persist credentials to :attr:`creds_file` atomically, mode 0600.
 
         Args:
             creds: The credentials to serialize.
@@ -258,16 +284,17 @@ class QuickAuthManager:
         A failure to write is logged but never raised — a working in-memory token
         must not be defeated by a disk problem.
         """
+        target = self.creds_file
         try:
-            QUICK_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(
-                dir=str(QUICK_CREDS_FILE.parent), prefix=".gateway-creds-", suffix=".tmp"
+                dir=str(target.parent), prefix=".gateway-creds-", suffix=".tmp"
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump(creds.to_dict(), fh, ensure_ascii=False, indent=2)
                 os.chmod(tmp_path, 0o600)
-                os.replace(tmp_path, QUICK_CREDS_FILE)
+                os.replace(tmp_path, target)
             except BaseException:
                 # Clean up the temp file on any failure before re-raising.
                 try:
@@ -276,7 +303,7 @@ class QuickAuthManager:
                     pass
                 raise
         except OSError as exc:
-            logger.warning("Failed to persist Quick creds to {}: {}", QUICK_CREDS_FILE, exc)
+            logger.warning("Failed to persist Quick creds to {}: {}", target, exc)
 
     async def _refresh(self, creds: QuickCredentials) -> None:
         """Refresh the access token against Keycloak, in place."""
@@ -369,13 +396,45 @@ async def keepalive_loop() -> None:
     while True:
         await asyncio.sleep(QUICK_KEEPALIVE_INTERVAL)
         try:
-            await quick_auth_manager.keepalive()
-            logger.debug("Quick keep-alive refresh ok.")
+            from quick.pool import pool
+
+            accounts = pool.discover()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - keep-alive must never crash the app
-            logger.warning(
-                "Quick keep-alive refresh failed ({}); retry in {}s.",
-                exc,
-                QUICK_KEEPALIVE_INTERVAL,
-            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the single-account path
+            logger.debug("Quick keep-alive: pool unavailable ({}); using process creds.", exc)
+            accounts = []
+
+        if not accounts:
+            try:
+                await quick_auth_manager.keepalive()
+                logger.debug("Quick keep-alive refresh ok.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep-alive must never crash the app
+                logger.warning(
+                    "Quick keep-alive refresh failed ({}); retry in {}s.",
+                    exc,
+                    QUICK_KEEPALIVE_INTERVAL,
+                )
+            continue
+
+        for account in accounts:
+            if account.disabled_reason:
+                continue
+            try:
+                await account.auth.keepalive()
+                logger.debug("Quick keep-alive refresh ok (account={}).", account.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad account must not stop the rest
+                # A refresh token that Keycloak rejects outright never recovers on its
+                # own; note_failure() turns that into a disabled account (and an alert
+                # on the next watch cycle) instead of a silent hole in the pool.
+                logger.warning(
+                    "Quick keep-alive refresh failed for account '{}' ({}); retry in {}s.",
+                    account.name, exc, QUICK_KEEPALIVE_INTERVAL,
+                )
+                from quick.pool import pool as _pool
+
+                _pool.note_failure(account, None, str(exc))

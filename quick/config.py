@@ -49,6 +49,61 @@ QUICK_CREDS_FILE: Path = Path(
 ).expanduser()
 
 # ==================================================================================================
+# Account pool (multi-account)
+# ==================================================================================================
+
+# Directory scanned for credential files, one per Quick account. Each match becomes a
+# pool member; the account NAME is derived from the filename suffix:
+#   gateway-creds.json      -> "default"
+#   gateway-creds-b.json    -> "b"
+# Adding an account is therefore "drop one more file in here and restart" — no nginx
+# upstream to edit, no extra container (contrast: the Kiro pool's per-account containers).
+QUICK_CREDS_DIR: Path = Path(
+    os.getenv("QUICK_CREDS_DIR", str(QUICK_CREDS_FILE.parent))
+).expanduser()
+
+# Glob applied inside QUICK_CREDS_DIR. Keep it narrow: state files (model-watch-state,
+# session-usage-state) live in the same directory and must NOT be mistaken for creds.
+QUICK_CREDS_GLOB: str = os.getenv("QUICK_CREDS_GLOB", "gateway-creds*.json")
+
+# Explicit account list ("default,b"), overriding auto-discovery. Each name N maps to
+# QUICK_CREDS_DIR/gateway-creds-N.json (N="default" -> gateway-creds.json).
+QUICK_ACCOUNTS: str = os.getenv("QUICK_ACCOUNTS", "")
+
+# How long an account stays out of rotation after a failure the backend gave no
+# resume hint for. When Quick DOES report ``resumeInMinutes``, that wins.
+QUICK_POOL_COOLDOWN_SECONDS: int = int(os.getenv("QUICK_POOL_COOLDOWN_SECONDS", "900"))
+
+# Remaining-percentage bucket width used to rank accounts. Ranking on the raw
+# percentage would ping-pong traffic between two accounts on every reading; bucketing
+# to 10 % keeps the choice stable and lets the in-flight count break the tie.
+QUICK_POOL_QUOTA_BUCKET: int = int(os.getenv("QUICK_POOL_QUOTA_BUCKET", "10"))
+
+# Prefer accounts with monthly headroom over accounts already running on overage.
+# Off by default: overage still serves traffic, and the rolling session allowance is
+# the bucket that actually blocks requests.
+QUICK_POOL_AVOID_OVERAGE: bool = os.getenv("QUICK_POOL_AVOID_OVERAGE", "0").lower() in (
+    "1", "true", "yes",
+)
+
+# How many accounts one request may try before giving up (1 = no failover).
+QUICK_POOL_MAX_ATTEMPTS: int = int(os.getenv("QUICK_POOL_MAX_ATTEMPTS", "2"))
+
+# ==================================================================================================
+# Public status page (read-only quota dashboard)
+# ==================================================================================================
+
+# Second HTTP server, serving ONLY the pool's quota page — never inference. It is a
+# separate app on a separate port precisely so that publishing it cannot expose
+# /quick/v1/messages (that would hand the account pool to the internet). 0 disables.
+QUICK_STATUS_PORT: int = int(os.getenv("QUICK_STATUS_PORT", "9090"))
+QUICK_STATUS_HOST: str = os.getenv("QUICK_STATUS_HOST", "0.0.0.0")
+
+# Optional shared secret. Empty (default) = the page is public. When set, requests
+# must carry ?t=<token> or the X-Status-Token header.
+QUICK_STATUS_TOKEN: str = os.getenv("QUICK_STATUS_TOKEN", "")
+
+# ==================================================================================================
 # Token refresh (Keycloak OIDC)
 # ==================================================================================================
 

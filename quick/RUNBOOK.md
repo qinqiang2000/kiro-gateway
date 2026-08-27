@@ -4,17 +4,33 @@ Cold-start guide to run/deploy **quick-gateway**. Background/protocol: `quick/RE
 
 **What it is:** a FastAPI proxy under `quick/`, wired into `main.py`. Exposes
 Anthropic-compatible `POST /quick/v1/messages` → Amazon Quick (Bedrock Converse).
-Coexists with the Kiro routes in the same server. Auth = portable file
-`~/.quickwork/gateway-creds.json`.
+Coexists with the Kiro routes in the same server. Auth = portable files
+`~/.quickwork/gateway-creds*.json`, **one per account** — the gateway pools them and
+picks the account with the most quota left (`quick/pool.py`). Live status:
+<http://43.160.157.90:9090/>.
 
-## 1. Get the creds file (once, on a mac signed into Amazon Quick)
+## 1. Get a creds file (once per account, on a mac signed into Amazon Quick)
 
 ```bash
 python -c "from quick.auth import QuickAuthManager; QuickAuthManager()._load()"  # 1 Keychain prompt, first time
 ls -l ~/.quickwork/gateway-creds.json   # verify: -rw------- (0600)
 ```
-Already exists → done (loads from file, no prompt). New account → sign that account
-into Amazon Quick desktop first, then run the above.
+
+**Adding another account** — sign it into the Amazon Quick desktop app (the app keeps
+only the newest profile in `profiles.json`, and deletes the previous account's Keychain
+item, so export each account right after signing it in), find its profile id, then export
+it into its **own** file. The filename decides the pool account name
+(`gateway-creds-b.json` → account `b`):
+
+```bash
+cat ~/.quickwork/profiles.json | python3 -c "import json,sys;print(json.load(sys.stdin)['last_active'])"
+QUICK_PROFILE_ID=<that id> QUICK_CREDS_FILE=~/.quickwork/gateway-creds-b.json \
+  python -c "from quick.auth import QuickAuthManager; QuickAuthManager()._load()"
+```
+
+The Keychain read pops one GUI approval dialog — click **Always Allow**. Then **quit the
+Quick desktop app**: a running app keeps rotating that account's refresh token and will
+invalidate the copy the server is using.
 
 ## 2. Run locally (mac)
 
@@ -30,17 +46,29 @@ Client: `ANTHROPIC_BASE_URL=http://localhost:8000/quick`, token ignored.
 ## 3. Deploy to Linux (from the mac, after §1)
 
 ```bash
-./quick/deploy.sh                              # defaults: HOST=43.160.157.90, PEM=~/tools/pem/rocky_test.pem
+./quick/deploy.sh                     # code only + rebuild — DOES NOT touch creds
+./quick/deploy.sh --creds b           # code + upload ONLY account b's creds
+./quick/deploy.sh --creds-only b      # only upload account b's creds, then restart
 HOST=1.2.3.4 PEM=~/keys/box.pem ./quick/deploy.sh   # new box
-# flags: --no-creds (code only) | --creds-only (rotate creds)
 ```
-Success ends with `→ deploy ok`. The script is idempotent and handles rsync
-`--checksum`, uid-999 chown, build, health-check, smoke-test. Container binds
-`127.0.0.1:8000` only (not public).
+
+> ⚠️ **Uploading creds is opt-in and per account, on purpose.** The container refreshes
+> and rewrites each file continuously; the Mac's copy of an account already running on
+> the box is a rotated-away token. Overwriting it kills that account. Only upload an
+> account you have just exported (§1).
+
+Success ends with the pool table and `→ deploy ok`. The script is idempotent and handles
+rsync `--checksum`, uid-999 chown, build, health-check, pool status, smoke-test.
+Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:9090`
+(public, read-only).
 
 ## 4. Gotchas (don't relearn)
 
 - Container runs as **uid 999** — the mounted `quickwork/` creds must be owned by 999.
+- **Account pool**: every `quickwork/gateway-creds*.json` is one account (`…-b.json` → `b`).
+  Requests go to the account with the most session allowance left, with failover; a
+  malformed request (400) is never retried on a second account. `/quick/pin/b/v1/messages`
+  pins one account. State files in the same dir are not mistaken for creds.
 - **`REFRESH_TOKEN=dummy`** in the compose only passes `main.py`'s startup check; Kiro
   routes are inert here (boot-time 401s are harmless). quick-gateway needs no Kiro creds.
 - id_token = 5-min TTL → frequent `Refreshed ... 300s` logs are NORMAL. refresh_token
@@ -51,9 +79,27 @@ Success ends with `→ deploy ok`. The script is idempotent and handles rsync
 - **web_search** is gateway-executed (key-less DuckDuckGo); **web_fetch**/images pass through.
 - Deploy always via `deploy.sh` (plain rsync skips edited files by mtime → stale container).
 
-## 5. Optional: behind litellm
+## 5. The status page (port 9090, public)
 
-quick-gateway is Anthropic-compatible. Add to litellm `config.yaml` (back it up first):
+<http://43.160.157.90:9090/> — one card per account: session allowance left, monthly
+used, ready/cooling/disabled, cooldown countdown. Auto-refreshes every 20 s. It is a
+**separate app on a separate port** (`quick/status_app.py`) with no inference route, so
+publishing it does not expose `/quick/v1/messages`. It shows no credential material —
+only the labels derived from filenames, so keep filenames neutral (`b`, `c`) rather than people's names.
+
+```bash
+curl -s localhost:8000/quick/pool | python3 -m json.tool   # same data, on the box
+docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --pool
+```
+
+Gate it with `QUICK_STATUS_TOKEN=<secret>` in `/opt/quick-gateway/.env` (then
+`?t=<secret>`), or turn it off with `QUICK_STATUS_PORT=0`.
+
+## 6. Optional: behind litellm
+
+quick-gateway is Anthropic-compatible, and the pool is invisible to litellm — one
+`api_base`, N accounts behind it. **No litellm change is needed to add an account.**
+Add to litellm `config.yaml` (back it up first):
 `api_base: http://quick-gateway:8000/quick`, `model: anthropic/claude-opus-quick`,
 `model_name: claude-opus-quick` → `docker restart litellm`. (Container must share
 litellm's docker network.)
@@ -67,7 +113,7 @@ litellm only reads these on restart; verify with
 `curl -s localhost:4000/v1/model/info -H "Authorization: Bearer <master-key>"` and by
 checking `spend` on the next `LiteLLM_SpendLogs` row.
 
-## 6. Watch for a newer model
+## 7. Watch for a newer model
 
 Quick's model registry is a **public CloudFront JSON** (no auth, no DataPlane traffic) —
 diff it instead of probing inference. Exit code 10 = changed:
@@ -106,10 +152,10 @@ docker compose -p quick-gateway exec quick-gateway \
 ```
 
 `available` → set `QUICK_FORCE_MODEL` to it in the compose and restart; also add it to
-`QUICK_MODELS` in `quick/config.py`, and add a litellm entry if it is fronted there (§5).
+`QUICK_MODELS` in `quick/config.py`, and add a litellm entry if it is fronted there (§6).
 Background: `quick/README.md` → "Detecting a new model".
 
-## 7. Watch the session allowance
+## 8. Watch the session allowance
 
 Quick meters a rolling **session** allowance plus a monthly entitlement, and attaches
 both to every inference response (`usageSummary` on the Converse `metadata` frame).
@@ -132,7 +178,7 @@ one 1-token request (haiku) to refresh the reading — so the CLI needs creds, i
 it in the container, not on the mac. Background: `quick/README.md` → "Watching the
 session allowance".
 
-## 8. Trouble
+## 9. Trouble
 
 - Startup "No Kiro credentials" → set `REFRESH_TOKEN` (any value) in the compose.
 - "No Quick credentials: cache file absent" (Linux) → creds not copied / not owned by 999.
@@ -141,5 +187,11 @@ session allowance".
 - 403 "not authorized" → account IAM-denied for that model.
 - web_search empty → DuckDuckGo changed markup/rate-limited; fix regex in `quick/websearch.py`.
 - Session-usage alert never fires → check `QUICK_ALERT_WEBHOOK` is set (else log-only) and
-  that `"armed": true` in `quickwork/session-usage-state.json`.
+  that `"armed": true` under `accounts.<name>` in `quickwork/session-usage-state.json`.
+- An account shows **disabled** on the status page → its refresh token is dead
+  (`invalid_grant`); re-export it on the mac (§1) and `./quick/deploy.sh --creds-only <name>`.
+- An account shows **cooling** → normal: its allowance hit 0 or entitlement was revoked;
+  it returns by itself. A *low but usable* account stays `ready` (a low `resumeInMinutes`
+  is a window-reset countdown, not a lockout).
+- All accounts unusable → the pool pushes one alert; add an account (§1 + §3).
 - Before shipping: `pytest tests/unit/test_quick_gateway.py -v`.

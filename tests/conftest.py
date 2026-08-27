@@ -20,6 +20,25 @@ from fastapi.testclient import TestClient
 
 
 # =============================================================================
+# Quick gateway isolation
+# =============================================================================
+
+@pytest.fixture(autouse=True)
+def _no_status_server():
+    """Keep the Quick pool status page from binding a real port during tests.
+
+    main.py's lifespan starts it, and TestClient runs that lifespan — without this
+    every TestClient-based test would open a listening socket on the host.
+    """
+    import quick.config as quick_config
+
+    original = quick_config.QUICK_STATUS_PORT
+    quick_config.QUICK_STATUS_PORT = 0
+    yield
+    quick_config.QUICK_STATUS_PORT = original
+
+
+# =============================================================================
 # Event Loop Fixtures
 # =============================================================================
 

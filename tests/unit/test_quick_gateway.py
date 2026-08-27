@@ -509,7 +509,7 @@ class TestWebSearchLoop:
             def __init__(self, *a): self.error = None; self._i = calls["n"]
             def result(self): return rounds[self._i]
 
-        async def _fake_round(ci, mid, model):
+        async def _fake_round(ci, mid, model, account=None):
             agg = _FakeAgg()
             calls["n"] += 1
             return agg
@@ -540,7 +540,7 @@ class TestWebSearchLoop:
             error = None
             def result(self): return msg
 
-        async def _fake_round(ci, mid, model): return _FakeAgg()
+        async def _fake_round(ci, mid, model, account=None): return _FakeAgg()
         searched = []
         async def _fake_search(q, max_results=6): searched.append(q); return []
         monkeypatch.setattr(al, "_run_one_round", _fake_round)
@@ -962,3 +962,326 @@ class TestUsageAlertMessage:
         text = format_alert(parse_usage_summary(_usage_summary(99, status="THROTTLED")))
 
         assert "THROTTLED" in text
+
+
+# ==================================================================================================
+# Account pool (quick/pool.py) — selection, cooldown, failover
+# ==================================================================================================
+
+@pytest.fixture
+def pool_env(tmp_path, monkeypatch):
+    """A pool of two accounts backed by temp credential files, with clean state."""
+    import quick.pool as qp
+    import quick.usage_watch as uw
+
+    for name in ("gateway-creds.json", "gateway-creds-b.json"):
+        (tmp_path / name).write_text(json.dumps(_sample_blob()), encoding="utf-8")
+    monkeypatch.setattr(qp, "QUICK_CREDS_DIR", tmp_path)
+    monkeypatch.setattr(qp, "QUICK_CREDS_FILE", tmp_path / "gateway-creds.json")
+    monkeypatch.setattr(qp, "QUICK_ACCOUNTS", "")
+    monkeypatch.setattr(qp, "QUICK_POOL_AVOID_OVERAGE", False)
+    uw._snapshots.clear()
+    monkeypatch.setattr(uw, "_latest", None)
+    qp.pool._accounts = {}
+    qp.pool.discover()
+    yield qp.pool
+    qp.pool._accounts = {}
+    uw._snapshots.clear()
+
+
+def _reading(account: str, session_used: float, **kw):
+    """Record a usageSummary for one account."""
+    import quick.usage_watch as uw
+
+    uw.record_usage_summary(_usage_summary(session_used, **kw), account=account)
+
+
+class TestPoolDiscoverySuccess:
+    def test_filenames_become_account_names(self, pool_env):
+        assert [a.name for a in pool_env.accounts()] == ["default", "b"]
+
+    def test_each_account_owns_its_own_creds_file(self, pool_env):
+        files = {a.name: a.auth.creds_file.name for a in pool_env.accounts()}
+        assert files == {"default": "gateway-creds.json", "b": "gateway-creds-b.json"}
+
+    def test_explicit_account_list_wins(self, pool_env, monkeypatch, tmp_path):
+        import quick.pool as qp
+
+        monkeypatch.setattr(qp, "QUICK_ACCOUNTS", "b")
+        assert [a.name for a in pool_env.discover(force=True)] == ["b"]
+
+    def test_state_files_are_not_mistaken_for_credentials(self, pool_env, tmp_path):
+        (tmp_path / "session-usage-state.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "model-watch-state.json").write_text("{}", encoding="utf-8")
+
+        assert [a.name for a in pool_env.discover(force=True)] == ["default", "b"]
+
+
+class TestPoolSelectionSuccess:
+    def test_picks_the_account_with_more_session_allowance(self, pool_env):
+        _reading("default", 80)   # 20% left
+        _reading("b", 10)         # 90% left
+
+        assert pool_env.select().name == "b"
+
+    def test_unmeasured_account_is_assumed_fresh(self, pool_env):
+        # 'default' measured low, 'b' never measured -> 'b' should get the traffic.
+        _reading("default", 95)
+
+        assert pool_env.select().name == "b"
+
+    def test_same_bucket_alternates_instead_of_ping_ponging(self, pool_env):
+        _reading("default", 41)   # 59% left -> bucket 5
+        _reading("b", 45)         # 55% left -> bucket 5
+        picks = []
+        for _ in range(4):
+            account = pool_env.select()
+            picks.append(account.name)
+            pool_env.begin(account)
+            pool_env.end(account)
+
+        assert picks == ["default", "b", "default", "b"]  # alternates, never sticks
+
+    def test_exclude_skips_an_already_tried_account(self, pool_env):
+        _reading("default", 10)
+
+        assert pool_env.select(exclude={"default"}).name == "b"
+
+    def test_inflight_breaks_a_bucket_tie(self, pool_env):
+        _reading("default", 10)
+        _reading("b", 10)
+        first = pool_env.select()
+        pool_env.begin(first)   # leave it in flight
+
+        assert pool_env.select().name != first.name
+
+
+class TestPoolFailureHandling:
+    def test_throttling_cools_the_account_down(self, pool_env):
+        account = pool_env.get("default")
+        pool_env.note_failure(account, 429, "Too many requests")
+
+        assert account.status() == "cooling"
+        assert pool_env.select().name == "b"
+
+    def test_invalid_grant_disables_permanently(self, pool_env):
+        account = pool_env.get("b")
+        pool_env.note_failure(account, 400, "Keycloak refresh failed (400): invalid_grant")
+
+        assert account.status() == "disabled"
+        assert "invalid_grant" in account.disabled_reason or account.disabled_reason
+        assert pool_env.select().name == "default"
+
+    def test_exhausted_allowance_cools_down_until_the_window_resets(self, pool_env):
+        import time as _time
+
+        _reading("default", 100, resume=42)   # 0% left, window resets in 42 min
+        account = pool_env.get("default")
+
+        assert account.status() == "cooling"
+        assert 41 * 60 <= account.cooldown_until - _time.time() <= 42 * 60
+
+    def test_a_low_but_usable_account_is_not_benched(self, pool_env):
+        """resumeInMinutes is a window-reset countdown, not a lockout (verified live)."""
+        _reading("default", 79, resume=55)    # 21% left, still ALLOWED
+
+        assert pool_env.get("default").status() == "ready"
+
+    def test_a_low_account_still_ranks_below_a_fresh_one(self, pool_env):
+        _reading("default", 79, resume=55)    # 21% left
+        _reading("b", 0)                      # 100% left
+
+        assert pool_env.select().name == "b"
+
+    def test_revoked_entitlement_takes_the_account_out(self, pool_env):
+        _reading("b", 50, status="BLOCKED")
+
+        assert pool_env.get("b").status() == "cooling"
+        assert pool_env.select().name == "default"
+
+    def test_everything_down_yields_no_candidate(self, pool_env):
+        for account in pool_env.accounts():
+            pool_env.note_failure(account, 429, "throttled")
+
+        assert pool_env.select() is None
+
+    def test_a_recovered_account_comes_back_on_its_own(self, pool_env, monkeypatch):
+        import time as _time
+
+        account = pool_env.get("default")
+        pool_env.note_failure(account, 429, "throttled")
+        monkeypatch.setattr(_time, "time", lambda: account.cooldown_until + 1)
+
+        assert account.status() == "ready"
+
+
+class TestPoolSnapshotSafety:
+    def test_snapshot_carries_no_credential_material(self, pool_env):
+        _reading("default", 30)
+        blob = json.dumps(pool_env.snapshot())
+
+        for secret in ("token", "tenant", "arn", "refresh", "qbs-", "Bearer"):
+            assert secret not in blob, f"status payload leaked {secret!r}"
+
+    def test_snapshot_reports_readiness_and_quota(self, pool_env):
+        _reading("default", 30)
+        snapshot = pool_env.snapshot()
+
+        assert snapshot["total"] == 2 and snapshot["ready"] == 2
+        entry = next(a for a in snapshot["accounts"] if a["name"] == "default")
+        assert entry["session_remaining_pct"] == 70 and entry["status"] == "ready"
+
+
+class TestRequestFailoverSuccess:
+    """A dead account must cost a log line, not a user-visible error."""
+
+    def _ok_stream(self):
+        frames = [
+            _quick_frame("messageStart", {"role": "assistant"}),
+            _quick_frame("contentBlockDelta", {"contentBlockIndex": 0,
+                                               "delta": {"text": "hi"}}),
+            _quick_frame("messageStop", {"stopReason": "end_turn"}),
+        ]
+        return frames
+
+    def _fake_converse(self, failing: str, error):
+        """converse_stream double: `failing` account raises, the other streams fine."""
+        frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account is not None and account.name == failing:
+                raise error
+            for frame in frames:
+                yield frame
+
+        return _gen
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_retries_on_the_next_account(self, pool_env, monkeypatch):
+        import quick.routes as qr
+        from quick.client import QuickAPIError
+
+        _reading("default", 10)   # 90% left -> tried first
+        _reading("b", 60)         # 40% left -> the fallback
+        monkeypatch.setattr(qr, "converse_stream",
+                            self._fake_converse("default", QuickAPIError(429, "throttled")))
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert error is None
+        assert final["content"][0]["text"] == "hi"
+        assert pool_env.get("default").status() == "cooling"
+
+    @pytest.mark.asyncio
+    async def test_a_bad_request_does_not_burn_a_second_account(self, pool_env, monkeypatch):
+        import quick.routes as qr
+        from quick.client import QuickAPIError
+
+        async def _always_400(converse_input, account=None):
+            raise QuickAPIError(400, "Improperly formed request")
+            yield b""  # pragma: no cover - generator marker
+
+        monkeypatch.setattr(qr, "converse_stream", _always_400)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert final is None and error.status_code == 400
+        # Nothing was blamed on the accounts: both stay ready.
+        assert [a.status() for a in pool_env.accounts()] == ["ready", "ready"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_fails_over_before_the_first_token(self, pool_env, monkeypatch):
+        import quick.routes as qr
+        from quick.client import QuickAPIError
+
+        _reading("default", 10)   # 90% left -> tried first
+        _reading("b", 60)         # 40% left -> the fallback
+        monkeypatch.setattr(qr, "converse_stream",
+                            self._fake_converse("default", QuickAPIError(403, "not authorized")))
+
+        chunks = [c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")]
+        body = "".join(chunks)
+
+        assert "event: error" not in body           # the client never saw the failure
+        assert "message_start" in body and "hi" in body
+        assert body.count("event: message_start") == 1   # not restarted mid-stream
+
+    @pytest.mark.asyncio
+    async def test_in_stream_error_frame_also_fails_over(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        ok_frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account.name == "default":
+                # HTTP 200 with an error frame — Quick's IAM-deny shape.
+                yield _quick_frame("error", {"message": "User is not authorized"})
+                return
+            for frame in ok_frames:
+                yield frame
+
+        _reading("default", 10)   # 90% left -> tried first
+        _reading("b", 60)         # 40% left -> the fallback
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert "event: error" not in body and "hi" in body
+
+    @pytest.mark.asyncio
+    async def test_pinned_account_never_fails_over(self, pool_env, monkeypatch):
+        import quick.routes as qr
+        from quick.client import QuickAPIError
+
+        monkeypatch.setattr(qr, "converse_stream",
+                            self._fake_converse("b", QuickAPIError(429, "throttled")))
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="b", websearch=False)
+
+        assert final is None and error.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_empty_pool_is_a_503_not_a_crash(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        for account in pool_env.accounts():
+            pool_env.note_failure(account, 429, "throttled")
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert final is None and error.status_code == 503
+
+
+class TestStatusPageSafety:
+    def test_token_gate_is_open_when_unset(self, monkeypatch):
+        import quick.status_app as sa
+
+        monkeypatch.setattr(sa, "QUICK_STATUS_TOKEN", "")
+
+        class _Req:
+            query_params = {}
+            headers = {}
+
+        assert sa._authorized(_Req()) is True
+
+    def test_token_gate_rejects_a_wrong_token(self, monkeypatch):
+        import quick.status_app as sa
+
+        monkeypatch.setattr(sa, "QUICK_STATUS_TOKEN", "s3cret")
+
+        class _Req:
+            query_params = {"t": "nope"}
+            headers = {}
+
+        assert sa._authorized(_Req()) is False
+
+    def test_page_has_no_inference_route(self):
+        from quick.status_app import create_status_app
+
+        paths = {r.path for r in create_status_app().routes}
+
+        assert paths == {"/", "/api/pool", "/health"}
