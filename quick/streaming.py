@@ -21,6 +21,8 @@ import json
 import struct
 from typing import Any, Dict, Generator, Iterator, List, Optional
 
+from quick.usage_watch import observe_event
+
 JsonDict = Dict[str, Any]
 
 
@@ -150,6 +152,9 @@ def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
     """
     payload = event.get("payload") or {}
     if event.get("event_type") == "bedrockStreamEvent" and isinstance(payload, dict) and "eventType" in payload:
+        # The wrapper also carries the account's entitlement snapshot (``usageSummary``,
+        # on ``metadata`` frames) — hand it to the session watch before dropping it.
+        observe_event(event)
         inner = payload.get("payload") or {}
         etype = payload.get("eventType")
         # Surface errors and modeled exceptions carried inside the wrapper. Quick

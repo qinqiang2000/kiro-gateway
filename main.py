@@ -570,6 +570,17 @@ async def lifespan(app: FastAPI):
     except Exception as _qmw_exc:  # noqa: BLE001 - Quick backend is optional
         logger.warning(f"Quick model watch task not started: {_qmw_exc}")
 
+    # --- Quick session-usage watch (optional) ---
+    # Reads the entitlement snapshot Quick attaches to every inference response and
+    # alerts once when the session allowance runs low. See quick/usage_watch.py.
+    quick_usage_watch_task = None
+    try:
+        from quick.usage_watch import watch_loop as _quick_usage_watch_loop
+
+        quick_usage_watch_task = asyncio.create_task(_quick_usage_watch_loop())
+    except Exception as _quw_exc:  # noqa: BLE001 - Quick backend is optional
+        logger.warning(f"Quick session-usage watch task not started: {_quw_exc}")
+
     yield
 
     # Graceful shutdown
@@ -590,6 +601,13 @@ async def lifespan(app: FastAPI):
         quick_model_watch_task.cancel()
         try:
             await quick_model_watch_task
+        except asyncio.CancelledError:
+            pass
+
+    if quick_usage_watch_task is not None:
+        quick_usage_watch_task.cancel()
+        try:
+            await quick_usage_watch_task
         except asyncio.CancelledError:
             pass
 

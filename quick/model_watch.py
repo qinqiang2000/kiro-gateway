@@ -17,8 +17,8 @@ So detection is two-stage:
 
 1. **Watch** (zero risk): conditional ``GET`` of that JSON (ETag / If-None-Match).
    It is a CDN object, needs no credentials, never touches the tenant DataPlane,
-   and one poll per hour is 1/60 of what the desktop app itself does. Changes are
-   logged and (optionally) pushed to a chat webhook.
+   and one poll every five hours is ~1/300 of what the desktop app itself does.
+   Changes are logged and (optionally) pushed to a chat webhook.
 2. **Probe** (one request, only when stage 1 reports something new): a single
    1-token ``ConverseStream`` against the new id to see whether *this account* is
    authorized, classifying the answer as available / denied / unknown-model.
@@ -68,7 +68,9 @@ QUICK_MODEL_WATCH_STATE: Path = Path(
 ).expanduser()
 
 # Background-task interval when the watch runs inside the gateway (0 disables it).
-QUICK_MODEL_WATCH_INTERVAL: int = int(os.getenv("QUICK_MODEL_WATCH_INTERVAL", "3600"))
+# Five hours: the registry is a slow-moving CDN object, and a staged rollout stays up
+# for days — polling it more often only adds noise.
+QUICK_MODEL_WATCH_INTERVAL: int = int(os.getenv("QUICK_MODEL_WATCH_INTERVAL", "18000"))
 
 # Chat webhook for alerts (Yunzhijia robot: POST {"content": "…"}). Empty = log only.
 # Keep the token in .env — never commit it.
@@ -446,10 +448,11 @@ async def watch_once(save: bool = True, notify: bool = False) -> Tuple[JsonDict,
 async def watch_loop() -> None:
     """Background task: poll the public config forever and alert on changes.
 
-    Runs on :data:`QUICK_MODEL_WATCH_INTERVAL` (0 disables it). One poll per hour
-    is 1/60 of the desktop app's own rate against the same CDN object, and it
-    never touches the tenant DataPlane. Failures are logged and retried; the task
-    never crashes the app, and cancellation on shutdown is clean.
+    Runs on :data:`QUICK_MODEL_WATCH_INTERVAL` (0 disables it; default 5 h). One
+    poll every five hours is a rounding error against the desktop app's own rate
+    on the same CDN object, and it never touches the tenant DataPlane. Failures
+    are logged and retried; the task never crashes the app, and cancellation on
+    shutdown is clean.
     """
     if QUICK_MODEL_WATCH_INTERVAL <= 0:
         logger.info("Quick model watch disabled (QUICK_MODEL_WATCH_INTERVAL=0).")

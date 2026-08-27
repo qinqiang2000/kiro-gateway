@@ -1,0 +1,534 @@
+# -*- coding: utf-8 -*-
+
+"""Watch the Amazon Quick account's session allowance and alert before it runs out.
+
+Amazon Quick meters two buckets — a rolling **session** allowance and a **monthly**
+entitlement. The desktop app renders both in its profile flyout ("Session usage 27 %",
+the bar turning red at 90 %). Those numbers come from ``GET /profile/usage`` on the
+app's *local* HTTP server — a headless gateway has no such server, and the tenant
+DataPlane does not serve that path (verified: 404 ``UnknownOperationException``).
+
+The same numbers ride along on **every inference response**: the Converse
+``metadata`` event carries a ``usageSummary`` sibling of the event payload::
+
+    {"entitlementStatus": "ALLOWED",
+     "overageEnabled": true,
+     "sessionUsage": {"resumeInMinutes": 0, "usedPercentage": 38},
+     "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 720,
+                      "resetsAt": 1788220800, "usedPercentage": 100}}
+
+``usedPercentage`` is the share **consumed**, so what the alert cares about is
+``100 - usedPercentage`` — the share still available.
+
+That makes the watch nearly free: every response the gateway already streams updates
+the snapshot (:func:`observe_event`, called from :mod:`quick.streaming`). A cycle
+spends one 1-token request only when the gateway has been idle longer than the watch
+interval and has nothing fresh to read.
+
+The alert is **edge-triggered with hysteresis**: it fires once when the remaining
+share drops below :data:`QUICK_SESSION_ALERT_REMAINING_PCT`, then stays silent until
+the share recovers to at or above that threshold (a new session window, typically) —
+so a long stretch at 3 % costs one message, not one per hour.
+
+Usage::
+
+    python -m quick.usage_watch              # read the current usage (probes if stale)
+    python -m quick.usage_watch --json       # machine-readable report
+    python -m quick.usage_watch --notify     # also push an alert to the webhook
+    python -m quick.usage_watch --probe      # force a fresh 1-token probe
+
+Exit codes: ``0`` above the threshold, ``10`` below it, ``1`` usage unreadable.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+from loguru import logger
+
+from quick.config import QUICKWORK_HOME
+from quick.model_watch import QUICK_ALERT_WEBHOOK, send_alert
+
+# Mirrors quick/model_watch.py: the CLI runs without importing main.py, so the .env
+# has to be loaded here too.
+load_dotenv()
+
+JsonDict = Dict[str, object]
+
+# Background-task interval when the watch runs inside the gateway (0 disables it).
+QUICK_SESSION_WATCH_INTERVAL: int = int(os.getenv("QUICK_SESSION_WATCH_INTERVAL", "3600"))
+
+# Alert when the *remaining* session share drops below this many percent. The app's
+# own progress bar turns red at 90 % used, i.e. 10 % remaining.
+QUICK_SESSION_ALERT_REMAINING_PCT: float = float(
+    os.getenv("QUICK_SESSION_ALERT_REMAINING_PCT", "10")
+)
+
+# Where the armed/disarmed flag and the last reading are kept, so a restart does not
+# re-fire an alert that was already sent.
+QUICK_SESSION_WATCH_STATE: Path = Path(
+    os.getenv("QUICK_SESSION_WATCH_STATE", str(QUICKWORK_HOME / "session-usage-state.json"))
+).expanduser()
+
+# Model used for the fallback probe — the cheapest authorized one; the usageSummary
+# is account-wide, so the model only decides what the probe costs.
+QUICK_SESSION_PROBE_MODEL: str = os.getenv(
+    "QUICK_SESSION_PROBE_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+
+PROBE_TIMEOUT_SECONDS: float = 60.0
+
+
+# ==================================================================================================
+# Snapshot
+# ==================================================================================================
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """One reading of the account's entitlement, as reported by Quick."""
+
+    session_used_pct: Optional[float]
+    session_remaining_pct: Optional[float]
+    resume_in_minutes: int = 0
+    monthly_used_pct: Optional[float] = None
+    monthly_resets_at: Optional[int] = None
+    entitlement_status: str = ""
+    overage_enabled: bool = False
+    observed_at: float = field(default_factory=time.time)
+
+    def age_seconds(self) -> float:
+        """Seconds since this reading was taken."""
+        return max(0.0, time.time() - self.observed_at)
+
+    def to_dict(self) -> JsonDict:
+        """Render the snapshot as a JSON-friendly dict (for reports and state)."""
+        return {
+            "session_used_pct": self.session_used_pct,
+            "session_remaining_pct": self.session_remaining_pct,
+            "resume_in_minutes": self.resume_in_minutes,
+            "monthly_used_pct": self.monthly_used_pct,
+            "monthly_resets_at": self.monthly_resets_at,
+            "entitlement_status": self.entitlement_status,
+            "overage_enabled": self.overage_enabled,
+            "observed_at": self.observed_at,
+            "age_seconds": round(self.age_seconds(), 1),
+        }
+
+
+def _num(value: object) -> Optional[float]:
+    """Coerce a JSON scalar to ``float``, or ``None`` if it is not numeric."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_usage_summary(summary: object) -> Optional[UsageSnapshot]:
+    """Parse Quick's ``usageSummary`` object into a :class:`UsageSnapshot`.
+
+    Args:
+        summary: The ``usageSummary`` value from a Converse ``metadata`` frame.
+
+    Returns:
+        The parsed snapshot, or ``None`` if the object is missing or carries no
+        session percentage (nothing to alert on).
+    """
+    if not isinstance(summary, dict):
+        return None
+    session = summary.get("sessionUsage")
+    session = session if isinstance(session, dict) else {}
+    used = _num(session.get("usedPercentage"))
+    if used is None:
+        return None
+    monthly = summary.get("monthlyUsage")
+    monthly = monthly if isinstance(monthly, dict) else {}
+    resets_at = _num(monthly.get("resetsAt"))
+    resume = _num(session.get("resumeInMinutes")) or 0.0
+    return UsageSnapshot(
+        session_used_pct=used,
+        session_remaining_pct=max(0.0, 100.0 - used),
+        resume_in_minutes=int(resume),
+        monthly_used_pct=_num(monthly.get("usedPercentage")),
+        monthly_resets_at=int(resets_at) if resets_at else None,
+        entitlement_status=str(summary.get("entitlementStatus") or ""),
+        overage_enabled=bool(summary.get("overageEnabled")),
+    )
+
+
+# ==================================================================================================
+# Passive observation (free — every response the gateway serves carries the numbers)
+# ==================================================================================================
+
+_latest: Optional[UsageSnapshot] = None
+
+
+def record_usage_summary(summary: object) -> None:
+    """Record a ``usageSummary`` as the newest reading. Never raises."""
+    global _latest
+    snapshot = parse_usage_summary(summary)
+    if snapshot is None:
+        return
+    previous = _latest
+    _latest = snapshot
+    if previous is None or previous.session_used_pct != snapshot.session_used_pct:
+        logger.debug(
+            "Quick session usage: {}% used ({}% left), monthly {}% used.",
+            _pct(snapshot.session_used_pct),
+            _pct(snapshot.session_remaining_pct),
+            _pct(snapshot.monthly_used_pct),
+        )
+
+
+def observe_event(event: JsonDict) -> None:
+    """Record the ``usageSummary`` carried by one decoded Quick stream frame.
+
+    Quick hangs the entitlement snapshot off the ``bedrockStreamEvent`` *wrapper*
+    (a sibling of ``eventType``/``payload``), so this takes the raw decoded frame —
+    before :func:`quick.streaming._unwrap_bedrock_event` drops the wrapper. Frames
+    without a summary (i.e. all but ``metadata``) are ignored.
+
+    Args:
+        event: A decoded event dict from :class:`quick.streaming.EventStreamDecoder`.
+    """
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        record_usage_summary(payload.get("usageSummary"))
+
+
+def latest_snapshot() -> Optional[UsageSnapshot]:
+    """The newest reading seen in this process, if any."""
+    return _latest
+
+
+# ==================================================================================================
+# Active probe (only when the passive reading is stale)
+# ==================================================================================================
+
+async def probe_usage(model_id: str = "") -> Optional[UsageSnapshot]:
+    """Spend one 1-token request to refresh the usage snapshot.
+
+    Args:
+        model_id: Model to probe with; defaults to :data:`QUICK_SESSION_PROBE_MODEL`.
+
+    Returns:
+        The fresh snapshot, or ``None`` if the request failed or returned no
+        ``usageSummary``.
+    """
+    # Imported here so the passive path works on a host without Quick credentials,
+    # and to keep quick.streaming's import of this module acyclic.
+    from quick.client import QuickAPIError, converse_stream
+    from quick.streaming import EventStreamDecoder
+
+    converse_input: JsonDict = {
+        "modelId": model_id or QUICK_SESSION_PROBE_MODEL,
+        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        "inferenceConfig": {"maxTokens": 1},
+    }
+    decoder = EventStreamDecoder()
+    before = _latest
+
+    async def _drive() -> None:
+        async for chunk in converse_stream(converse_input):
+            for event in decoder.feed(chunk):
+                observe_event(event)
+
+    try:
+        await asyncio.wait_for(_drive(), PROBE_TIMEOUT_SECONDS)
+    except QuickAPIError as exc:
+        logger.warning("Session-usage probe failed: HTTP {} {}", exc.status_code, exc.message[:200])
+        return None
+    except asyncio.TimeoutError:
+        logger.warning("Session-usage probe timed out after {}s.", PROBE_TIMEOUT_SECONDS)
+        return None
+    except Exception as exc:  # noqa: BLE001 - a probe must never take the caller down
+        logger.warning("Session-usage probe failed: {}: {}", type(exc).__name__, exc)
+        return None
+
+    if _latest is None or _latest is before:
+        logger.warning("Session-usage probe returned no usageSummary.")
+        return None
+    return _latest
+
+
+async def read_usage(max_age: float, allow_probe: bool = True) -> Optional[UsageSnapshot]:
+    """Return a usage reading, probing only if the passive one is too old.
+
+    Args:
+        max_age: How old (seconds) the passive reading may be and still count as
+            current. A busy gateway refreshes it on every response.
+        allow_probe: Whether a stale reading may be refreshed with one request.
+
+    Returns:
+        The freshest snapshot available, or ``None`` if there is none.
+    """
+    snapshot = _latest
+    if snapshot is not None and snapshot.age_seconds() <= max_age:
+        return snapshot
+    if not allow_probe:
+        return snapshot
+    return await probe_usage() or snapshot
+
+
+# ==================================================================================================
+# Alert state (edge-triggered, so a long stretch below the threshold alerts once)
+# ==================================================================================================
+
+def load_state() -> JsonDict:
+    """Load the saved alert state, or an empty state if there is none."""
+    try:
+        return json.loads(QUICK_SESSION_WATCH_STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Session-usage state unreadable ({}); starting fresh.", exc)
+        return {}
+
+
+def save_state(state: JsonDict) -> None:
+    """Persist the alert state (best effort — a failure only costs a repeat alert)."""
+    try:
+        QUICK_SESSION_WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
+        QUICK_SESSION_WATCH_STATE.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("Could not write session-usage state: {}", exc)
+
+
+def _pct(value: Optional[float]) -> str:
+    """Render a percentage without a trailing ``.0``."""
+    if value is None:
+        return "?"
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+
+def _reset_time(epoch: Optional[int]) -> str:
+    """Render a reset timestamp as ``YYYY-MM-DD HH:MM UTC``."""
+    if not epoch:
+        return ""
+    try:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def format_alert(snapshot: UsageSnapshot, threshold: float = QUICK_SESSION_ALERT_REMAINING_PCT) -> str:
+    """Render a low-session-allowance alert as a short chat message.
+
+    Args:
+        snapshot: The reading that tripped the threshold.
+        threshold: The remaining-percentage threshold that was crossed.
+
+    Returns:
+        Three or four lines: how much is left, when it comes back, the monthly
+        bucket for context, and the rule for the next alert.
+    """
+    lines = [
+        f"⚠️ Quick 会话额度告警：剩余 {_pct(snapshot.session_remaining_pct)}%"
+        f"（已用 {_pct(snapshot.session_used_pct)}%，阈值 剩余 <{_pct(threshold)}%）"
+    ]
+    if snapshot.resume_in_minutes:
+        lines.append(f"会话已限流，约 {snapshot.resume_in_minutes} 分钟后恢复")
+    if snapshot.monthly_used_pct is not None:
+        monthly = f"月度：已用 {_pct(snapshot.monthly_used_pct)}%"
+        if snapshot.overage_enabled:
+            monthly += "（overage 开启）"
+        reset = _reset_time(snapshot.monthly_resets_at)
+        if reset:
+            monthly += f"，{reset} 重置"
+        lines.append(monthly)
+    if snapshot.entitlement_status and snapshot.entitlement_status != "ALLOWED":
+        lines.append(f"entitlementStatus: {snapshot.entitlement_status}")
+    lines.append(f"恢复到 剩余 ≥{_pct(threshold)}% 后才会再次告警")
+    return "\n".join(lines)
+
+
+# ==================================================================================================
+# Watch cycle
+# ==================================================================================================
+
+async def watch_once(
+    notify: bool = False,
+    save: bool = True,
+    allow_probe: bool = True,
+    threshold: float = QUICK_SESSION_ALERT_REMAINING_PCT,
+) -> Tuple[JsonDict, bool]:
+    """Run one cycle: read the usage, alert if it just crossed the threshold, persist.
+
+    The alert is edge-triggered: it fires only while the state is *armed*, and the
+    state re-arms once the remaining share is back at or above ``threshold``. A push
+    that fails leaves the state armed, so the next cycle retries instead of losing
+    the alert.
+
+    Args:
+        notify: Whether to push an alert to the webhook (log-only when ``False``).
+        save: Whether to write the state back (``False`` for a dry run).
+        allow_probe: Whether a stale reading may be refreshed with one request.
+        threshold: Remaining-percentage threshold to alert below.
+
+    Returns:
+        ``(report, alerted)`` — ``alerted`` is ``True`` only when a push succeeded.
+    """
+    state = load_state()
+    armed = state.get("armed") is not False  # unknown / first run = armed
+    snapshot = await read_usage(max_age=float(QUICK_SESSION_WATCH_INTERVAL or 3600),
+                                allow_probe=allow_probe)
+    if snapshot is None:
+        logger.warning("Quick session usage unavailable (no response seen and no probe result).")
+        return {"available": False, "armed": armed, "threshold": threshold}, False
+
+    remaining = snapshot.session_remaining_pct
+    low = remaining is not None and remaining < threshold
+    fired = False
+
+    if low and armed:
+        if notify:
+            fired = await send_alert(format_alert(snapshot, threshold))
+            if not fired:
+                logger.warning("Session-usage alert push failed; staying armed to retry "
+                               "on the next cycle.")
+        else:
+            logger.warning("Quick session allowance低于阈值：剩余 {}% (< {}%) — 告警未推送"
+                           "（未开启 notify / 未配置 webhook）。",
+                           _pct(remaining), _pct(threshold))
+        if fired:
+            armed = False
+    elif not low:
+        armed = True  # recovered (or a new session window) — re-arm for the next drop
+
+    report: JsonDict = dict(snapshot.to_dict())
+    report.update({
+        "available": True,
+        "threshold": threshold,
+        "below_threshold": low,
+        "armed": armed,
+        "alert_pushed": fired,
+    })
+    if save:
+        new_state: JsonDict = {"armed": armed, "last": snapshot.to_dict(),
+                               "updated_at": time.time()}
+        if fired:
+            new_state["alerted_at"] = time.time()
+        elif state.get("alerted_at") is not None and not armed:
+            new_state["alerted_at"] = state["alerted_at"]
+        save_state(new_state)
+    return report, fired
+
+
+async def watch_loop() -> None:
+    """Background task: check the session allowance forever and alert when it runs low.
+
+    Runs on :data:`QUICK_SESSION_WATCH_INTERVAL` (0 disables it). While the gateway
+    is serving traffic this costs nothing — the reading comes from responses it
+    already streams; only an idle interval spends one 1-token request. Failures are
+    logged and retried; the task never crashes the app, and cancellation on shutdown
+    is clean.
+    """
+    if QUICK_SESSION_WATCH_INTERVAL <= 0:
+        logger.info("Quick session-usage watch disabled (QUICK_SESSION_WATCH_INTERVAL=0).")
+        return
+    logger.info(
+        "Quick session-usage watch started (interval: {}s, alert below {}% remaining, "
+        "alerts: {}).",
+        QUICK_SESSION_WATCH_INTERVAL,
+        _pct(QUICK_SESSION_ALERT_REMAINING_PCT),
+        "on" if QUICK_ALERT_WEBHOOK else "log-only",
+    )
+    while True:
+        try:
+            report, fired = await watch_once(notify=bool(QUICK_ALERT_WEBHOOK))
+            if report.get("available") and not fired:
+                logger.info("Quick session usage: {}% left ({}% used).",
+                            _num_pct(report, "session_remaining_pct"),
+                            _num_pct(report, "session_used_pct"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the watch must never crash the app
+            logger.warning("Quick session-usage watch cycle failed ({}); retry in {}s.",
+                           exc, QUICK_SESSION_WATCH_INTERVAL)
+        await asyncio.sleep(QUICK_SESSION_WATCH_INTERVAL)
+
+
+# ==================================================================================================
+# CLI
+# ==================================================================================================
+
+def _num_pct(report: JsonDict, key: str) -> str:
+    """Render one percentage field of a report dict."""
+    return _pct(_num(report.get(key)))
+
+
+def _log_report(report: JsonDict) -> None:
+    """Render a watch report as human-readable log lines."""
+    if not report.get("available"):
+        logger.error("Session usage unavailable — no response seen yet and the probe failed.")
+        return
+    line = (f"Session: {_num_pct(report, 'session_remaining_pct')}% left "
+            f"({_num_pct(report, 'session_used_pct')}% used), "
+            f"monthly {_num_pct(report, 'monthly_used_pct')}% used")
+    resets_at = _num(report.get("monthly_resets_at"))
+    reset = _reset_time(int(resets_at) if resets_at else None)
+    if reset:
+        line += f" (resets {reset})"
+    line += f", reading {report.get('age_seconds')}s old"
+    if report.get("below_threshold"):
+        logger.warning("{} — BELOW the {}% threshold (alert {}).", line,
+                       _num_pct(report, "threshold"),
+                       "pushed" if report.get("alert_pushed") else "not pushed")
+    else:
+        logger.info("{} — above the {}% threshold.", line, _num_pct(report, "threshold"))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code: 0 = above threshold, 10 = below it, 1 = unreadable.
+    """
+    parser = argparse.ArgumentParser(
+        description="Watch the Amazon Quick account's session allowance."
+    )
+    parser.add_argument("--json", action="store_true", help="print the report as JSON")
+    parser.add_argument("--no-save", action="store_true", help="do not update the state file")
+    parser.add_argument("--notify", action="store_true",
+                        help="push an alert to QUICK_ALERT_WEBHOOK when below the threshold")
+    parser.add_argument("--probe", action="store_true",
+                        help="force a fresh 1-token probe instead of any cached reading")
+    parser.add_argument("--threshold", type=float, default=QUICK_SESSION_ALERT_REMAINING_PCT,
+                        help="remaining-percentage threshold to alert below "
+                             f"(default {QUICK_SESSION_ALERT_REMAINING_PCT})")
+    args = parser.parse_args(argv)
+
+    if args.probe:
+        asyncio.run(probe_usage())
+
+    report, _ = asyncio.run(watch_once(notify=args.notify, save=not args.no_save,
+                                       threshold=args.threshold))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _log_report(report)
+    if not report.get("available"):
+        return 1
+    return 10 if report.get("below_threshold") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

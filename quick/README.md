@@ -87,8 +87,9 @@ Content-Type: application/json
 
 Response is an AWS event stream. Every frame's `:event-type` header is
 `bedrockStreamEvent`; the JSON payload is `{"eventType": "<Converse event>",
-"payload": {…}}` (unwrapped in `streaming.py`). The `metadata` event also carries
-a `usageSummary` (entitlement / monthly quota) which the gateway ignores.
+"payload": {…}}` (unwrapped in `streaming.py`). The `metadata` frame carries one
+extra sibling — `usageSummary`, the account's session / monthly entitlement —
+which `usage_watch.py` reads (see "Watching the session allowance").
 
 The sibling non-stream path `/integration/quick-work/bedrock-proxy` uses a
 different (InvokeModel) schema, so the gateway routes **everything** through the
@@ -104,6 +105,8 @@ stream path and aggregates for non-streaming responses.
 | `streaming.py` | event-stream decoder, `bedrockStreamEvent` unwrap, SSE translator + aggregator |
 | `client.py` | DataPlane HTTP client (envelope + id_token bearer + retry) |
 | `websearch.py` | key-less DuckDuckGo web search (executes `web_search` gateway-side) |
+| `model_watch.py` | watch the public model registry, alert on a newer Opus |
+| `usage_watch.py` | watch the session allowance, alert once when it runs low |
 | `agent_loop.py` | model↔web_search loop (Path B): run, search, feed back, repeat |
 | `routes.py` | FastAPI `/quick/v1/messages` |
 
@@ -180,12 +183,13 @@ python -m quick.model_watch --json     # machine-readable report
 ```
 
 Exit code `10` = something changed (cron-friendly); state and ETag live in
-`~/.quickwork/model-watch-state.json` (`QUICK_MODEL_WATCH_STATE`). Hourly polling is
-1/60 of the app's own rate against a CDN object with no credentials attached, so it
+`~/.quickwork/model-watch-state.json` (`QUICK_MODEL_WATCH_STATE`). Polling every 5 h is
+~1/300 of the app's own rate against a CDN object with no credentials attached, so it
 cannot trip inference-side rate limiting.
 
 The gateway also runs this on a timer itself: `main.py`'s lifespan starts
-`watch_loop()` every `QUICK_MODEL_WATCH_INTERVAL` seconds (default 3600, `0` disables).
+`watch_loop()` every `QUICK_MODEL_WATCH_INTERVAL` seconds (default 18000 = 5 h,
+`0` disables).
 Every change is logged at WARNING, but **only an upgrade is pushed** to the chat robot
 (`POST {"content": "…"}`) — three lines, no config dump:
 
@@ -202,7 +206,7 @@ remaps and retired ids are log-only too.
 
 | env | meaning |
 |-----|---------|
-| `QUICK_MODEL_WATCH_INTERVAL` | poll interval in seconds; `0` = off (default 3600) |
+| `QUICK_MODEL_WATCH_INTERVAL` | poll interval in seconds; `0` = off (default 18000 = 5 h) |
 | `QUICK_ALERT_WEBHOOK` | chat webhook URL; empty = log only. **Secret — `.env` only, this repo is public** |
 | `QUICK_UPGRADE_BASELINE` | the model an alert must beat; defaults to `QUICK_FORCE_MODEL` |
 | `QUICK_ALERT_ALL_CHANGES` | `1` to also push non-upgrade changes (noisy; off by default) |
@@ -230,6 +234,70 @@ all — stop trying it.
 > container), never on the mac while the Linux gateway is live: any auth path here
 > refreshes Keycloak and rotates the `refresh_token`, which invalidates the copy the
 > other host is using. `--probe` needs creds; the plain watch does not.
+
+
+## Watching the session allowance (`usage_watch.py`)
+
+Amazon Quick meters two buckets — a rolling **session** allowance and a **monthly**
+entitlement. The desktop app shows both in its profile flyout ("Session usage 27 %",
+the bar turning red at 90 %). Those numbers come from `GET /profile/usage` on the
+app's *local* HTTP server, which a headless gateway does not have — and the tenant
+DataPlane does not serve that path (verified: 404 `UnknownOperationException`).
+
+They do ride along on **every inference response**, though: the Converse `metadata`
+frame carries a `usageSummary` sibling of the event payload (verified live):
+
+```json
+{"entitlementStatus": "ALLOWED",
+ "overageEnabled": true,
+ "sessionUsage": {"resumeInMinutes": 0, "usedPercentage": 38},
+ "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 720,
+                  "resetsAt": 1788220800, "usedPercentage": 100}}
+```
+
+`usedPercentage` is the share **consumed**, so what matters for an alert is
+`100 - usedPercentage` — the share still available.
+
+So the watch is nearly free: `streaming.py` hands every wrapper frame to
+`observe_event()`, which keeps the newest reading in memory. `main.py`'s lifespan
+runs `watch_loop()` every `QUICK_SESSION_WATCH_INTERVAL` seconds (default 3600,
+`0` disables); a cycle spends **one 1-token request only if** the gateway has been
+idle longer than that interval and has nothing fresh to read.
+
+The alert is **edge-triggered with hysteresis** — one message per crossing:
+
+```
+⚠️ Quick 会话额度告警：剩余 9%（已用 91%，阈值 剩余 <10%）
+月度：已用 100%（overage 开启），2026-09-01 00:00 UTC 重置
+恢复到 剩余 ≥10% 后才会再次告警
+```
+
+It fires when the remaining share first drops below
+`QUICK_SESSION_ALERT_REMAINING_PCT` (default 10 — where the app itself turns its bar
+red), then stays silent all the way down to 0 %. It re-arms only once the remaining
+share is back at or above the threshold (a new session window), so a long stretch at
+3 % costs one message, not one per hour. The armed flag lives in
+`~/.quickwork/session-usage-state.json` (`QUICK_SESSION_WATCH_STATE`), so a restart
+does not re-fire. A failed push leaves the state armed and the next cycle retries.
+
+```bash
+python -m quick.usage_watch           # current reading (probes if stale) - exit 10 = below threshold
+python -m quick.usage_watch --json    # machine-readable
+python -m quick.usage_watch --probe   # force a fresh 1-token probe
+# on the box:
+docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --json
+```
+
+| env | meaning |
+|-----|---------|
+| `QUICK_SESSION_WATCH_INTERVAL` | check interval in seconds; `0` = off (default 3600) |
+| `QUICK_SESSION_ALERT_REMAINING_PCT` | alert below this much remaining (default 10) |
+| `QUICK_SESSION_PROBE_MODEL` | model for the idle-fallback probe (default haiku-4.5) |
+| `QUICK_SESSION_WATCH_STATE` | armed-flag state file |
+| `QUICK_ALERT_WEBHOOK` | same webhook as the model watch; empty = log only |
+
+> The CLI needs credentials when it has to probe, so run it **on the host that owns
+> them** (the deployed container), like `model_watch --probe`.
 
 
 ## Thinking (extended reasoning)

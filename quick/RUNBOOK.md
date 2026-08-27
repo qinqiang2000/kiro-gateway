@@ -79,7 +79,7 @@ docker compose -p quick-gateway exec quick-gateway python -m quick.model_watch
 ```
 
 **The gateway already does this on a timer** — `main.py` starts `watch_loop()` every
-`QUICK_MODEL_WATCH_INTERVAL` s (default 3600). Every change is logged at WARNING;
+`QUICK_MODEL_WATCH_INTERVAL` s (default 18000 = 5 h). Every change is logged at WARNING;
 only an **upgrade** (a newer Opus-class model, i.e. one beating `QUICK_UPGRADE_BASELINE`)
 is pushed to the chat robot, in three lines, when `QUICK_ALERT_WEBHOOK` is set
 (`QUICK_ALERT_ALL_CHANGES=1` pushes everything — noisy). The webhook is a secret and **this repo
@@ -109,7 +109,30 @@ docker compose -p quick-gateway exec quick-gateway \
 `QUICK_MODELS` in `quick/config.py`, and add a litellm entry if it is fronted there (§5).
 Background: `quick/README.md` → "Detecting a new model".
 
-## 7. Trouble
+## 7. Watch the session allowance
+
+Quick meters a rolling **session** allowance plus a monthly entitlement, and attaches
+both to every inference response (`usageSummary` on the Converse `metadata` frame).
+`quick/usage_watch.py` reads them for free from the traffic the gateway already
+serves — no extra API, no polling of the DataPlane:
+
+```bash
+docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --json
+# {"session_remaining_pct": 62, "session_used_pct": 38, "monthly_used_pct": 100, ...}
+```
+
+`main.py` runs `watch_loop()` every `QUICK_SESSION_WATCH_INTERVAL` s (default 3600).
+It pushes **one** message to `QUICK_ALERT_WEBHOOK` when the remaining share first
+drops below `QUICK_SESSION_ALERT_REMAINING_PCT` (default 10 %), then stays quiet until
+it recovers past that mark — the armed flag lives in
+`quickwork/session-usage-state.json` next to the creds, so a restart does not re-fire.
+Beware the sign: the API reports `usedPercentage` (consumed); the alert is about
+`100 - used`. If the gateway has been idle longer than the interval, the cycle spends
+one 1-token request (haiku) to refresh the reading — so the CLI needs creds, i.e. run
+it in the container, not on the mac. Background: `quick/README.md` → "Watching the
+session allowance".
+
+## 8. Trouble
 
 - Startup "No Kiro credentials" → set `REFRESH_TOKEN` (any value) in the compose.
 - "No Quick credentials: cache file absent" (Linux) → creds not copied / not owned by 999.
@@ -117,4 +140,6 @@ Background: `quick/README.md` → "Detecting a new model".
 - 502 "validation error ... toolSpec" → a tool schema Bedrock rejects (`quick/converters.py`).
 - 403 "not authorized" → account IAM-denied for that model.
 - web_search empty → DuckDuckGo changed markup/rate-limited; fix regex in `quick/websearch.py`.
+- Session-usage alert never fires → check `QUICK_ALERT_WEBHOOK` is set (else log-only) and
+  that `"armed": true` in `quickwork/session-usage-state.json`.
 - Before shipping: `pytest tests/unit/test_quick_gateway.py -v`.

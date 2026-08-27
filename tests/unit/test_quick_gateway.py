@@ -779,3 +779,186 @@ class TestAlertDeliveryErrors:
         from quick.model_watch import _accepted
 
         assert _accepted(self._resp("ok", "text/plain")) is True
+
+
+# ==================================================================================================
+# Session-usage watch (quick/usage_watch.py)
+# ==================================================================================================
+
+def _usage_summary(session_used, monthly_used=100, resume=0, status="ALLOWED"):
+    """Build a usageSummary exactly as the live DataPlane returns it."""
+    return {
+        "entitlementStatus": status,
+        "overageEnabled": True,
+        "sessionUsage": {"resumeInMinutes": resume, "usedPercentage": session_used},
+        "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 720,
+                         "resetsAt": 1788220800, "usedPercentage": monthly_used},
+    }
+
+
+@pytest.fixture
+def usage_state(tmp_path, monkeypatch):
+    """Point the watch at a temp state file and clear the in-process reading."""
+    import quick.usage_watch as uw
+
+    monkeypatch.setattr(uw, "QUICK_SESSION_WATCH_STATE", tmp_path / "session-usage-state.json")
+    monkeypatch.setattr(uw, "_latest", None)
+    return uw
+
+
+class TestUsageParsingSuccess:
+    def test_used_percentage_becomes_remaining(self):
+        from quick.usage_watch import parse_usage_summary
+
+        snap = parse_usage_summary(_usage_summary(38))
+
+        assert snap.session_used_pct == 38
+        assert snap.session_remaining_pct == 62
+        assert snap.monthly_used_pct == 100
+        assert snap.overage_enabled is True
+
+    def test_stream_metadata_frame_updates_the_snapshot(self, usage_state):
+        payload = {"usage": {"inputTokens": 8, "outputTokens": 1}}
+        frame = _frame("bedrockStreamEvent",
+                       {"eventType": "metadata", "payload": payload,
+                        "usageSummary": _usage_summary(91)})
+        translator = ConverseToAnthropicSSE("msg_1", "m")
+
+        for event in EventStreamDecoder().feed(frame):
+            translator.handle(event)
+
+        assert usage_state.latest_snapshot().session_remaining_pct == 9
+
+    def test_aggregator_path_also_records(self, usage_state):
+        frame = _frame("bedrockStreamEvent",
+                       {"eventType": "metadata", "payload": {"usage": {"inputTokens": 3}},
+                        "usageSummary": _usage_summary(50)})
+        aggregator = ConverseAggregator("msg_1", "m")
+
+        for event in EventStreamDecoder().feed(frame):
+            aggregator.add(event)
+
+        assert usage_state.latest_snapshot().session_used_pct == 50
+
+
+class TestUsageParsingEdgeCases:
+    def test_missing_or_junk_summary_is_ignored(self, usage_state):
+        from quick.usage_watch import parse_usage_summary, record_usage_summary
+
+        assert parse_usage_summary(None) is None
+        assert parse_usage_summary({"sessionUsage": {}}) is None
+        assert parse_usage_summary("nope") is None
+        record_usage_summary({"sessionUsage": {"usedPercentage": None}})
+
+        assert usage_state.latest_snapshot() is None
+
+    def test_plain_bedrock_frames_carry_no_summary(self, usage_state):
+        translator = ConverseToAnthropicSSE("msg_1", "m")
+
+        for event in EventStreamDecoder().feed(_frame("metadata", {"usage": {"inputTokens": 1}})):
+            translator.handle(event)
+
+        assert usage_state.latest_snapshot() is None
+
+    def test_over_100_percent_used_clamps_remaining_at_zero(self):
+        from quick.usage_watch import parse_usage_summary
+
+        assert parse_usage_summary(_usage_summary(140)).session_remaining_pct == 0
+
+
+class TestUsageAlertHysteresis:
+    """One alert per crossing: silent below the threshold until it recovers."""
+
+    async def _cycle(self, uw, used):
+        """Feed one reading through a full watch cycle."""
+        uw.record_usage_summary(_usage_summary(used))
+        return await uw.watch_once(notify=True, threshold=10)
+
+    @pytest.mark.asyncio
+    async def test_alerts_once_then_stays_quiet_until_recovery(self, usage_state, monkeypatch):
+        uw = usage_state
+        sent = []
+
+        async def _fake_send(content, webhook=""):
+            sent.append(content)
+            return True
+
+        monkeypatch.setattr(uw, "send_alert", _fake_send)
+
+        _, fired_ok = await self._cycle(uw, 50)          # 50% left - quiet
+        _, fired_low = await self._cycle(uw, 91)         # 9% left  - alert
+        _, fired_lower = await self._cycle(uw, 97)       # 3% left  - already alerted
+        _, fired_recovered = await self._cycle(uw, 20)   # 80% left - re-arms
+        _, fired_again = await self._cycle(uw, 95)       # 5% left  - alert again
+
+        assert [fired_ok, fired_low, fired_lower, fired_recovered, fired_again] == \
+            [False, True, False, False, True]
+        assert len(sent) == 2
+        assert "剩余 9%" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_exactly_at_the_threshold_does_not_alert(self, usage_state, monkeypatch):
+        uw = usage_state
+        monkeypatch.setattr(uw, "send_alert", lambda *a, **k: None)
+        uw.record_usage_summary(_usage_summary(90))  # exactly 10% left
+
+        report, fired = await uw.watch_once(notify=True, threshold=10)
+
+        assert fired is False
+        assert report["below_threshold"] is False
+
+    @pytest.mark.asyncio
+    async def test_failed_push_stays_armed_to_retry(self, usage_state, monkeypatch):
+        uw = usage_state
+
+        async def _fail(content, webhook=""):
+            return False
+
+        monkeypatch.setattr(uw, "send_alert", _fail)
+        uw.record_usage_summary(_usage_summary(95))
+
+        report, fired = await uw.watch_once(notify=True, threshold=10)
+
+        assert fired is False
+        assert report["armed"] is True
+        assert uw.load_state()["armed"] is True
+
+    @pytest.mark.asyncio
+    async def test_armed_state_survives_a_restart(self, usage_state, monkeypatch):
+        uw = usage_state
+        sent = []
+
+        async def _fake_send(content, webhook=""):
+            sent.append(content)
+            return True
+
+        monkeypatch.setattr(uw, "send_alert", _fake_send)
+        uw.record_usage_summary(_usage_summary(95))
+        await uw.watch_once(notify=True, threshold=10)
+
+        # A restart loses the in-process reading but not the state file.
+        monkeypatch.setattr(uw, "_latest", None)
+        uw.record_usage_summary(_usage_summary(96))
+        _, fired = await uw.watch_once(notify=True, threshold=10)
+
+        assert fired is False
+        assert len(sent) == 1
+
+
+class TestUsageAlertMessage:
+    def test_alert_names_both_numbers_and_the_rule(self):
+        from quick.usage_watch import format_alert, parse_usage_summary
+
+        text = format_alert(parse_usage_summary(_usage_summary(93, resume=42)), threshold=10)
+
+        assert "剩余 7%" in text
+        assert "已用 93%" in text
+        assert "42 分钟" in text
+        assert "月度：已用 100%" in text
+
+    def test_non_allowed_entitlement_is_surfaced(self):
+        from quick.usage_watch import format_alert, parse_usage_summary
+
+        text = format_alert(parse_usage_summary(_usage_summary(99, status="THROTTLED")))
+
+        assert "THROTTLED" in text
