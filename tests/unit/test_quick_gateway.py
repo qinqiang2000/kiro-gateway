@@ -734,3 +734,31 @@ class TestAlertFormatting:
         scope = "rule1[regions=us-west-2,eu-west-1,eu-central-1,eu-west-2]/cfg1(50%)/default/smart"
 
         assert _short_scope(scope) == "rule1[regions=us-west-2+3]/cfg1(50%)/default/smart"
+
+
+class TestAlertDeliveryErrors:
+    """A 2xx that the robot actually rejected must not count as delivered."""
+
+    def _resp(self, body: str, content_type: str = "application/json"):
+        import httpx
+
+        return httpx.Response(200, text=body, headers={"content-type": content_type})
+
+    def test_yunzhijia_failure_body_is_not_success(self):
+        from quick.model_watch import _accepted
+
+        body = '{"data":null,"error":"invalid token","errorCode":10001,"success":false}'
+
+        assert _accepted(self._resp(body)) is False
+
+    def test_yunzhijia_success_body_is_success(self):
+        from quick.model_watch import _accepted
+
+        body = '{"data":{"msgId":"BOT-1"},"error":null,"errorCode":0,"success":true}'
+
+        assert _accepted(self._resp(body)) is True
+
+    def test_non_json_body_is_taken_at_face_value(self):
+        from quick.model_watch import _accepted
+
+        assert _accepted(self._resp("ok", "text/plain")) is True

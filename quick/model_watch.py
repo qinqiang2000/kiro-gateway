@@ -290,7 +290,7 @@ async def send_alert(content: str, webhook: str = "") -> bool:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
             resp = await client.post(url, json={"content": content})
         if resp.status_code // 100 == 2:
-            return True
+            return _accepted(resp)
         logger.warning("Alert push returned HTTP {}: {}", resp.status_code, resp.text[:200])
     except httpx.HTTPError as exc:
         logger.warning("Alert push failed: {}", exc)
@@ -309,6 +309,33 @@ def _short_scope(scope: str) -> str:
     return _REGION_LIST_RE.sub(
         lambda m: f"regions={m.group(1).split(',')[0]}+{len(m.group(1).split(',')) - 1}", scope
     )
+
+
+def _accepted(resp: httpx.Response) -> bool:
+    """Whether a 2xx webhook response actually accepted the message.
+
+    Yunzhijia robots answer a rejected message (bad token, rate limit, …) with
+    HTTP 200 and ``{"success": false, "errorCode": N, "error": "…"}``, so a bare
+    status check would record a lost alert as delivered. Non-JSON bodies (other
+    robot flavours answer ``ok``) are taken at face value.
+
+    Args:
+        resp: The webhook response.
+
+    Returns:
+        ``True`` if the robot accepted the message.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return True
+    if not isinstance(body, dict):
+        return True
+    code = body.get("errorCode")
+    if body.get("success") is False or (code is not None and str(code) not in ("0", "")):
+        logger.warning("Alert push rejected by the robot: {}", resp.text[:200])
+        return False
+    return True
 
 
 def _where(mapping: Dict[str, str], model_id: str, limit: int = 3) -> List[str]:
