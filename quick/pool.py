@@ -417,6 +417,8 @@ class QuickPool:
                 "session_remaining_pct": account.session_remaining(),
                 "session_used_pct": usage.session_used_pct if usage else None,
                 "monthly_used_pct": usage.monthly_used_pct if usage else None,
+                "monthly_available_units": usage.monthly_available_units if usage else None,
+                "monthly_provisioned_units": usage.monthly_provisioned_units if usage else None,
                 "monthly_resets_at": usage.monthly_resets_at if usage else None,
                 "overage_enabled": bool(usage.overage_enabled) if usage else False,
                 "entitlement_status": usage.entitlement_status if usage else "",

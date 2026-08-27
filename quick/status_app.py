@@ -115,8 +115,15 @@ function render(d) {
           ? '<div class="note">冷却中，约 ' + left(a.cooldown_seconds_left) + "后恢复"
             + (a.cooldown_reason ? "（" + esc(a.cooldown_reason) + "）" : "") + "</div>"
           : "");
+    // overageEnabled is a standing setting, not a state — only say "超额" past 100%.
+    const units = (a.monthly_available_units === null || a.monthly_available_units === undefined
+                   || !a.monthly_provisioned_units)
+      ? "" : " · 剩 " + Math.round(a.monthly_available_units) + "/"
+             + Math.round(a.monthly_provisioned_units) + " 单位";
+    const over = (a.monthly_used_pct >= 100)
+      ? (a.overage_enabled ? "，已超额（overage 兜底，仍可用）" : "，已用尽") : "";
     const monthly = a.monthly_used_pct === null || a.monthly_used_pct === undefined
-      ? "" : "月度已用 " + pct(a.monthly_used_pct) + (a.overage_enabled ? "（overage）" : "");
+      ? "" : "月度已用 " + pct(a.monthly_used_pct) + units + over;
     return '<div class="card' + (a.status === "disabled" ? " dim" : "") + '">'
       + '<div class="row"><span class="name">' + esc(a.name) + "</span>"
       + '<span class="pill ' + a.status + '">' + (label[a.status] || a.status) + "</span></div>"

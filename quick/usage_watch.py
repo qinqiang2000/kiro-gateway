@@ -97,12 +97,20 @@ PROBE_TIMEOUT_SECONDS: float = 60.0
 
 @dataclass(frozen=True)
 class UsageSnapshot:
-    """One reading of the account's entitlement, as reported by Quick."""
+    """One reading of the account's entitlement, as reported by Quick.
+
+    The monthly bucket is metered in **units** (``availableUnits`` of
+    ``provisionedUnits``), which is the number worth watching: a percentage hides
+    how much headroom is actually left. Observed live: ~0.65 units per streaming
+    Opus request, on a 720-unit monthly allowance.
+    """
 
     session_used_pct: Optional[float]
     session_remaining_pct: Optional[float]
     resume_in_minutes: int = 0
     monthly_used_pct: Optional[float] = None
+    monthly_available_units: Optional[float] = None
+    monthly_provisioned_units: Optional[float] = None
     monthly_resets_at: Optional[int] = None
     entitlement_status: str = ""
     overage_enabled: bool = False
@@ -119,6 +127,8 @@ class UsageSnapshot:
             "session_remaining_pct": self.session_remaining_pct,
             "resume_in_minutes": self.resume_in_minutes,
             "monthly_used_pct": self.monthly_used_pct,
+            "monthly_available_units": self.monthly_available_units,
+            "monthly_provisioned_units": self.monthly_provisioned_units,
             "monthly_resets_at": self.monthly_resets_at,
             "entitlement_status": self.entitlement_status,
             "overage_enabled": self.overage_enabled,
@@ -167,6 +177,8 @@ def parse_usage_summary(summary: object) -> Optional[UsageSnapshot]:
         session_remaining_pct=max(0.0, 100.0 - used),
         resume_in_minutes=int(resume),
         monthly_used_pct=_num(monthly.get("usedPercentage")),
+        monthly_available_units=_num(monthly.get("availableUnits")),
+        monthly_provisioned_units=_num(monthly.get("provisionedUnits")),
         monthly_resets_at=int(resets_at) if resets_at else None,
         entitlement_status=str(summary.get("entitlementStatus") or ""),
         overage_enabled=bool(summary.get("overageEnabled")),
