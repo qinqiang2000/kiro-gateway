@@ -41,6 +41,18 @@ def _quick_frame(event_type: str, payload: dict) -> bytes:
     return _frame("bedrockStreamEvent", {"eventType": event_type, "payload": payload})
 
 
+def _block_frame(**kw) -> bytes:
+    """Build the entitlement-block frame exactly as the live DataPlane sends it.
+
+    Empty payload, the reason in the sibling ``usageSummary`` — and nothing else in
+    the whole stream (captured 2026-08-28, tenant overage turned off).
+    """
+    summary = _usage_summary(kw.pop("session_used", 0), status=kw.pop("status", "BLOCKED_MONTHLY"),
+                             overage=kw.pop("overage", False), **kw)
+    return _frame("bedrockStreamEvent",
+                  {"eventType": "usageLimitExceeded", "payload": {}, "usageSummary": summary})
+
+
 @pytest.fixture
 def no_force(monkeypatch):
     """Disable the global force-model override so mapping logic can be tested."""
@@ -1101,6 +1113,25 @@ class TestPoolFailureHandling:
         assert pool_env.get("b").status() == "cooling"
         assert pool_env.select().name == "default"
 
+    def test_a_monthly_block_waits_for_the_entitlement_reset(self, pool_env):
+        """A flat cooldown would free the account every 15 min to be refused again."""
+        import time as _time
+
+        _reading("b", 0, status="BLOCKED_MONTHLY", overage=False, units=0, provisioned=480)
+        account = pool_env.get("b")
+
+        assert account.status() == "cooling"
+        assert account.cooldown_until - _time.time() > 24 * 3600
+
+    def test_a_block_without_a_reset_falls_back_to_the_default_cooldown(self, pool_env):
+        import time as _time
+
+        _reading("b", 50, status="BLOCKED", units=5, resets_at=0)
+        account = pool_env.get("b")
+
+        assert account.status() == "cooling"
+        assert account.cooldown_until - _time.time() <= 15 * 60
+
     def test_everything_down_yields_no_candidate(self, pool_env):
         for account in pool_env.accounts():
             pool_env.note_failure(account, 429, "throttled")
@@ -1233,6 +1264,95 @@ class TestRequestFailoverSuccess:
         assert "event: error" not in body and "hi" in body
 
     @pytest.mark.asyncio
+    async def test_entitlement_block_fails_over_instead_of_answering_empty(
+        self, pool_env, monkeypatch
+    ):
+        """The block frame is the whole stream; serving it would be a blank answer."""
+        import quick.routes as qr
+
+        ok_frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account.name == "default":
+                yield _block_frame()
+                return
+            for frame in ok_frames:
+                yield frame
+
+        _reading("default", 10)
+        _reading("b", 60)
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert error is None
+        assert final["content"] == [{"type": "text", "text": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_streaming_entitlement_block_fails_over_before_the_first_token(
+        self, pool_env, monkeypatch
+    ):
+        import quick.routes as qr
+
+        ok_frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account.name == "default":
+                yield _block_frame()
+                return
+            for frame in ok_frames:
+                yield frame
+
+        _reading("default", 10)
+        _reading("b", 60)
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert "event: error" not in body and "hi" in body
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_pinned_account_reports_429_not_a_blank_message(
+        self, pool_env, monkeypatch
+    ):
+        import quick.routes as qr
+
+        async def _gen(converse_input, account=None):
+            yield _block_frame()
+
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="b", websearch=False)
+
+        assert final is None and error.status_code == 429
+        assert b"BLOCKED_MONTHLY" in error.body
+
+    @pytest.mark.asyncio
+    async def test_an_empty_stream_is_never_served_as_an_answer(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        ok_frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account.name == "default":
+                return
+                yield  # pragma: no cover - makes this an async generator
+            for frame in ok_frames:
+                yield frame
+
+        _reading("default", 10)
+        _reading("b", 60)
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert error is None
+        assert final["content"] == [{"type": "text", "text": "hi"}]
+
+    @pytest.mark.asyncio
     async def test_pinned_account_never_fails_over(self, pool_env, monkeypatch):
         import quick.routes as qr
         from quick.client import QuickAPIError
@@ -1256,6 +1376,57 @@ class TestRequestFailoverSuccess:
                                                   pinned="", websearch=False)
 
         assert final is None and error.status_code == 503
+
+
+class TestEntitlementBlockFrame:
+    """Quick refuses a blocked entitlement with its own event type, under HTTP 200."""
+
+    def _decoded(self, **kw):
+        return list(EventStreamDecoder().feed(_block_frame(**kw)))[0]
+
+    def test_the_block_frame_is_a_backend_error(self, usage_state):
+        from quick.streaming import backend_error
+
+        assert backend_error(self._decoded()) is not None
+
+    def test_the_message_names_the_entitlement_units_and_reset(self, usage_state):
+        from quick.streaming import backend_error
+
+        message = backend_error(self._decoded(units=0, provisioned=480))
+
+        assert "BLOCKED_MONTHLY" in message
+        assert "monthly units 0/480" in message
+        assert "overage off" in message
+        assert "2026-09-01" in message
+
+    def test_the_message_classifies_as_a_quota_block(self, usage_state):
+        from quick.pool import classify_failure
+        from quick.streaming import backend_error
+
+        kind, disable = classify_failure(429, backend_error(self._decoded()))
+
+        assert (kind, disable) == ("quota", False)
+
+    def test_the_aggregator_refuses_to_build_a_blank_message(self, usage_state):
+        aggregator = ConverseAggregator("msg_1", "m")
+
+        aggregator.add(self._decoded())
+
+        assert aggregator.error is not None
+
+    def test_a_normal_metadata_frame_is_still_not_an_error(self, usage_state):
+        from quick.streaming import backend_error
+
+        frame = _frame("bedrockStreamEvent",
+                       {"eventType": "metadata", "payload": {"usage": {"inputTokens": 3}},
+                        "usageSummary": _usage_summary(20)})
+
+        assert backend_error(list(EventStreamDecoder().feed(frame))[0]) is None
+
+    def test_a_junk_summary_still_yields_a_usable_message(self):
+        from quick.streaming import _usage_block_message
+
+        assert "entitlement" in _usage_block_message(None)
 
 
 class TestStatusPageSafety:

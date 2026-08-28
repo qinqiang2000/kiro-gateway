@@ -142,6 +142,12 @@ def _pick(pinned: str, exclude: Set[str]) -> Optional[Account]:
     return pool.select(exclude=exclude)
 
 
+# A response with no events at all is not an answer. Serving it would hand the client
+# a well-formed blank message — the failure mode that hid Quick's entitlement block for
+# six minutes of live traffic — so it is treated as a backend error and failed over.
+EMPTY_STREAM_ERROR = "Quick returned an empty stream (no events)"
+
+
 def _should_failover(status: Optional[int], message: str) -> bool:
     """Whether a failure is worth retrying on a different account.
 
@@ -158,7 +164,14 @@ def _should_failover(status: Optional[int], message: str) -> bool:
 
 def _backend_error_status(message: str) -> int:
     """Map an in-stream backend error to an HTTP status (Quick answers 200 for these)."""
-    return 403 if "not authorized" in (message or "").lower() else 502
+    text = (message or "").lower()
+    if "not authorized" in text:
+        return 403
+    # An entitlement block is a quota refusal, not a gateway fault: 429 is what a
+    # client (and litellm in front of it) already knows how to read.
+    if "usage limit" in text or "entitlement" in text:
+        return 429
+    return 502
 
 
 def _pool_exhausted_message(pinned: str) -> str:
@@ -195,11 +208,15 @@ async def _run_aggregated(
 
     aggregator = ConverseAggregator(message_id, model)
     decoder = EventStreamDecoder()
+    events = 0
     async for chunk in converse_stream(converse_input, account):
         for event in decoder.feed(chunk):
+            events += 1
             aggregator.add(event)
     if aggregator.error:
         return None, aggregator.error
+    if not events:
+        return None, EMPTY_STREAM_ERROR
     return aggregator.result(), None
 
 
@@ -364,6 +381,8 @@ async def _stream(
                         yield sse
                 if failure:
                     break
+            if not failure and not emitted:
+                failure = EMPTY_STREAM_ERROR
             if not failure:
                 for sse in translator.finish():
                     yield sse

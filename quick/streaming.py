@@ -19,6 +19,7 @@ Header:
 
 import json
 import struct
+from datetime import datetime, timezone
 from typing import Any, Dict, Generator, Iterator, List, Optional
 
 from quick.usage_watch import observe_event
@@ -146,6 +147,53 @@ def iter_eventstream_messages(
 # Bedrock Converse events -> Anthropic SSE
 # ==================================================================================================
 
+# Quick refuses a request whose entitlement is blocked with an event type of its
+# own — empty payload, the reason in the sibling ``usageSummary`` — instead of the
+# ``error`` frame it uses for an IAM deny. Captured live on 2026-08-28, when the
+# tenant admin turned overage off:
+#
+#     {"eventType": "usageLimitExceeded", "payload": {},
+#      "usageSummary": {"entitlementStatus": "BLOCKED_MONTHLY", "overageEnabled": false,
+#                       "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 480, ...}}}
+#
+# It is the *whole* stream: no messageStart, no content, no metadata. Treating it as
+# an ordinary unknown event left the translator producing a well-formed empty answer,
+# so clients saw a blank reply and the pool saw a success.
+USAGE_BLOCK_EVENT_TYPES = frozenset({"usageLimitExceeded"})
+
+
+def _usage_block_message(summary: object) -> str:
+    """Render an entitlement block as one actionable line of error text.
+
+    The block frame's own payload is empty, so everything worth saying comes from the
+    sibling ``usageSummary``. The text deliberately carries the word ``entitlement``,
+    which :func:`quick.pool.classify_failure` keys on to size the cooldown.
+
+    Args:
+        summary: The frame's ``usageSummary`` sibling, if it has one.
+
+    Returns:
+        A single line naming the entitlement state, the monthly units and the reset.
+    """
+    if not isinstance(summary, dict):
+        return "Quick usage limit exceeded: entitlement blocked"
+    monthly = summary.get("monthlyUsage")
+    monthly = monthly if isinstance(monthly, dict) else {}
+    parts = [f"Quick usage limit exceeded: entitlement {summary.get('entitlementStatus') or 'BLOCKED'}"]
+    provisioned = monthly.get("provisionedUnits")
+    if provisioned is not None:
+        parts.append(f"monthly units {monthly.get('availableUnits')}/{provisioned}")
+    parts.append("overage on" if summary.get("overageEnabled") else "overage off")
+    resets_at = monthly.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and resets_at:
+        try:
+            when = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+            parts.append(f"resets {when.strftime('%Y-%m-%d %H:%M UTC')}")
+        except (OverflowError, OSError, ValueError):
+            pass
+    return ", ".join(parts)
+
+
 def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
     """Normalize a Quick ``bedrockStreamEvent`` frame to a plain Converse event.
 
@@ -160,8 +208,13 @@ def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
         etype = payload.get("eventType")
         # Surface errors and modeled exceptions carried inside the wrapper. Quick
         # returns HTTP 200 even for backend failures (e.g. an IAM "explicit deny"
-        # on an unauthorized model) as an ``{"eventType":"error"}`` frame.
-        is_err = isinstance(etype, str) and (etype == "error" or etype.endswith("Exception"))
+        # on an unauthorized model) as an ``{"eventType":"error"}`` frame, and a
+        # blocked entitlement as a ``usageLimitExceeded`` one.
+        is_err = isinstance(etype, str) and (
+            etype == "error" or etype.endswith("Exception") or etype in USAGE_BLOCK_EVENT_TYPES
+        )
+        if etype in USAGE_BLOCK_EVENT_TYPES and not inner:
+            inner = {"message": _usage_block_message(payload.get("usageSummary"))}
         return {"event_type": etype, "message_type": "event",
                 "exception_type": etype if is_err else None, "payload": inner}
     return event
@@ -170,10 +223,11 @@ def _unwrap_bedrock_event(event: JsonDict) -> JsonDict:
 def backend_error(event: JsonDict) -> Optional[str]:
     """Return the error text if a decoded frame is a backend failure, else ``None``.
 
-    Quick answers HTTP 200 even for failures (an IAM deny, an exhausted allowance)
-    by putting an ``{"eventType": "error"}`` frame in the stream. The pool needs to
-    see that *before* any SSE has been written to the client, so it can fail over to
-    another account instead of turning it into a user-visible error.
+    Quick answers HTTP 200 even for failures by putting an ``{"eventType": "error"}``
+    frame in the stream (an IAM deny) or a ``usageLimitExceeded`` one (a blocked
+    entitlement). The pool needs to see that *before* any SSE has been written to the
+    client, so it can fail over to another account instead of turning it into a
+    user-visible error.
 
     Args:
         event: A decoded event from :class:`EventStreamDecoder`.

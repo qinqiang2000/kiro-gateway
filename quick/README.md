@@ -128,7 +128,8 @@ belongs to the client and the error is surfaced as-is.
 
 | condition | effect |
 |-----------|--------|
-| `entitlementStatus != ALLOWED` | cooldown (`QUICK_POOL_COOLDOWN_SECONDS`, default 15 min) |
+| `entitlementStatus != ALLOWED` | cooldown (`QUICK_POOL_COOLDOWN_SECONDS`, default 15 min) — but a **monthly** block waits for the reading's own `resetsAt` |
+| in-stream `usageLimitExceeded` frame | the request fails over; the account cools until `resetsAt` |
 | session allowance at 0 % | cooldown until the window resets |
 | 429 / IAM deny / backend error | cooldown 5 min / 5 min / 1 min, **doubling per consecutive failure** up to `QUICK_POOL_MAX_COOLDOWN_SECONDS` (1 h) |
 | a **real failure** while the monthly bucket is spent | re-classified as a quota block → cooldown until `resetsAt` |
@@ -160,8 +161,33 @@ working account on the guess that Quick *would* block it costs capacity for noth
 
 > **Trust the reading over the error text — but only after something failed.** When an
 > account's monthly bucket is spent, *any* failure is that block however the backend
-> words it (we have never seen the wording, because these accounts have always had
-> overage on). Keyword-matching alone would retry a month-long block every 60 s.
+> words it. Keyword-matching alone would retry a month-long block every 60 s.
+
+### How Quick refuses a blocked account (seen live 2026-08-28)
+
+The tenant admin turned overage off. Both accounts immediately read
+`entitlementStatus: BLOCKED_MONTHLY` with `provisionedUnits` zeroed, and every request
+came back as **HTTP 200 carrying exactly one frame** — no `messageStart`, no content,
+no `metadata`:
+
+```json
+{"eventType": "usageLimitExceeded", "payload": {},
+ "usageSummary": {"entitlementStatus": "BLOCKED_MONTHLY", "overageEnabled": false,
+                  "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 480,
+                                   "resetsAt": 1788220800, "usedPercentage": 100}}}
+```
+
+It is **not** the `{"eventType":"error"}` shape an IAM deny uses, and its own payload is
+empty — the reason lives in the sibling `usageSummary`. Before this was recognised, the
+translator turned that stream into a well-formed *empty answer*: `content: []`,
+0 input/0 output tokens, `stop_reason: end_turn` — a blank reply to the client and a
+recorded success for the pool. Now `streaming.py` treats it as a backend error, which
+buys the whole existing chain: fail over before the first token, surface **429** with
+the entitlement, units and reset time in the text, and (via `note_failure`) cool the
+account until `resetsAt` instead of releasing it every 15 minutes to be refused again.
+
+The same lesson generalised: **a stream with no events at all is never served as an
+answer.** An empty body fails over like any other backend error.
 
 ### Overage preference
 
@@ -328,8 +354,10 @@ Quick id by exact id/alias, else by family (Opus→opus-4-8, Sonnet→sonnet-4-6
 Haiku→haiku-4-5). The client's `/model` menu (Opus 5, Sonnet 5, …) is its own
 list and is *not* served by this gateway.
 
-Backend failures arrive as an in-stream `{"eventType":"error"}` frame under HTTP
-200; the gateway surfaces these as real errors (403 for IAM denies, else 502).
+Backend failures arrive in-stream under HTTP 200: `{"eventType":"error"}` for an IAM
+deny, `{"eventType":"usageLimitExceeded"}` for a blocked entitlement. The gateway
+surfaces these as real errors (403 for IAM denies, 429 for an entitlement block, else
+502) rather than as empty completions.
 
 ### Detecting a new model (`model_watch.py`)
 

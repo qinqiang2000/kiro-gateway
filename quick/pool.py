@@ -137,10 +137,13 @@ def classify_failure(status: Optional[int], message: str) -> Tuple[str, bool]:
     text = (message or "").lower()
     if "invalid_grant" in text or "token is not active" in text:
         return "auth", True
-    if status == 429 or "throttl" in text or "too many requests" in text:
-        return "throttled", False
+    # Quota before throttling: an entitlement block is surfaced to the client as 429
+    # (the honest code for "no capacity"), so the status alone would read as
+    # throttling and earn a 5-minute cooldown instead of waiting for the reset.
     if "entitlement" in text or "quota" in text or "allowance" in text or "exhaust" in text:
         return "quota", False
+    if status == 429 or "throttl" in text or "too many requests" in text:
+        return "throttled", False
     if status == 403 or "not authorized" in text or "explicit deny" in text:
         return "denied", False
     if status == 401 or "credential" in text or "refresh failed" in text:
@@ -515,9 +518,16 @@ class QuickPool:
         if account is None:
             return
         if snapshot.entitlement_status and snapshot.entitlement_status != "ALLOWED":
-            self.cool_down(
-                account, _COOLDOWN_BY_KIND["quota"], f"entitlement {snapshot.entitlement_status}"
-            )
+            reason = f"entitlement {snapshot.entitlement_status}"
+            # A monthly block lasts until the entitlement resets, so the reading's own
+            # ``resetsAt`` is the honest deadline. A flat cooldown would instead release
+            # the account every 15 minutes to spend one more rejected request — and,
+            # before the block was recognised as a failure at all, to hand one client an
+            # empty answer each time it came back.
+            if account.monthly_exhausted() or "MONTHLY" in snapshot.entitlement_status.upper():
+                self.cool_down_until(account, snapshot.monthly_resets_at, reason)
+            else:
+                self.cool_down(account, _COOLDOWN_BY_KIND["quota"], reason)
         elif snapshot.session_remaining_pct is not None and snapshot.session_remaining_pct <= 0:
             seconds = (snapshot.resume_in_minutes * 60) or _COOLDOWN_BY_KIND["quota"]
             self.cool_down(account, seconds, "session allowance exhausted")
