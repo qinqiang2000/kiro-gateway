@@ -259,6 +259,42 @@ def latest_snapshot() -> Optional[UsageSnapshot]:
     return _latest
 
 
+_restored = False
+
+
+def restore_snapshots() -> int:
+    """Seed the in-memory readings from the persisted state, once per process.
+
+    Without this the pool is blind for the first requests after every restart: with
+    no reading, an account cannot be known to be on overage or out of units, so the
+    money guard and the quota bench are both inert exactly when a redeploy has just
+    reset them. The restored readings keep their original ``observed_at``, so they
+    still count as stale and the next cycle refreshes them — stale is strictly better
+    than absent here, because "unknown" is treated as a *full* allowance.
+
+    Returns:
+        How many account readings were restored.
+    """
+    global _restored
+    if _restored:
+        return 0
+    _restored = True
+    fields = {f for f in UsageSnapshot.__dataclass_fields__}
+    restored = 0
+    for name, entry in (load_all_state().get("accounts") or {}).items():
+        last = entry.get("last") if isinstance(entry, dict) else None
+        if not isinstance(last, dict):
+            continue
+        try:
+            _snapshots[name] = UsageSnapshot(**{k: v for k, v in last.items() if k in fields})
+            restored += 1
+        except TypeError as exc:  # a state file from an older field layout
+            logger.debug("Could not restore the {} usage reading: {}", name, exc)
+    if restored:
+        logger.info("Restored {} persisted Quick usage reading(s).", restored)
+    return restored
+
+
 def snapshot_for(account: str) -> Optional[UsageSnapshot]:
     """The newest reading for one account, if it has been measured.
 
@@ -631,7 +667,11 @@ async def watch_pool_once(
     fired_any = False
     reports: List[JsonDict] = []
     for account in accounts:
-        report, fired = await watch_once(notify=notify, save=save, allow_probe=allow_probe,
+        # An account benched until a known deadline (monthly reset, session window,
+        # dead credential) needs no probe — it would just fail, once per cycle, until
+        # the deadline. Its reading resumes the moment real traffic returns to it.
+        probe = allow_probe and not account.cooling() and not account.disabled_reason
+        report, fired = await watch_once(notify=notify, save=save, allow_probe=probe,
                                          threshold=threshold, account=account.name)
         reports.append(report)
         fired_any = fired_any or fired

@@ -168,11 +168,16 @@ def _pool_exhausted_message(pinned: str) -> str:
         return f"Quick 账号 '{pinned}' 不存在或不可用。已知账号：{known}"
     snapshot = pool.snapshot()
     detail = "；".join(
-        f"{a['name']}={a['status']}" + (f"({a['cooldown_reason'] or a['disabled_reason']})"
-                                        if (a["cooldown_reason"] or a["disabled_reason"]) else "")
+        f"{a['name']}={a['status']}" + _account_reason(a, snapshot)
         for a in snapshot["accounts"]
     ) or "账号池为空"
     return f"Quick 账号池无可用账号：{detail}"
+
+
+def _account_reason(account: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+    """Parenthesised reason for one account's state, or "" when it needs none."""
+    reason = account.get("cooldown_reason") or account.get("disabled_reason") or ""
+    return f"({reason})" if reason else ""
 
 
 async def _run_aggregated(

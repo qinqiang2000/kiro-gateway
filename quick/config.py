@@ -79,11 +79,23 @@ QUICK_POOL_COOLDOWN_SECONDS: int = int(os.getenv("QUICK_POOL_COOLDOWN_SECONDS", 
 # to 10 % keeps the choice stable and lets the in-flight count break the tie.
 QUICK_POOL_QUOTA_BUCKET: int = int(os.getenv("QUICK_POOL_QUOTA_BUCKET", "10"))
 
-# Prefer accounts with monthly headroom over accounts already running on overage.
-# Off by default: overage still serves traffic, and the rolling session allowance is
-# the bucket that actually blocks requests.
+# DEPRECATED alias for QUICK_POOL_OVERAGE_POLICY="avoid". Kept so an existing
+# deployment that sets it keeps its behaviour.
 QUICK_POOL_AVOID_OVERAGE: bool = os.getenv("QUICK_POOL_AVOID_OVERAGE", "0").lower() in (
     "1", "true", "yes",
+)
+
+# How the pool ORDERS an account whose monthly entitlement is spent:
+#   avoid — pick it last, while any account still has monthly headroom   (default)
+#   allow — ignore the distinction and rank purely on the session allowance
+# This is a preference, never an eviction: an account leaves the pool only when it
+# actually stops working. A spent account that Quick still serves keeps serving.
+QUICK_POOL_OVERAGE_POLICY: str = os.getenv("QUICK_POOL_OVERAGE_POLICY", "avoid").strip().lower()
+
+# Ceiling for the exponential back-off applied to an account that keeps failing, so a
+# persistently broken one is retried every hour rather than every minute forever.
+QUICK_POOL_MAX_COOLDOWN_SECONDS: int = int(
+    os.getenv("QUICK_POOL_MAX_COOLDOWN_SECONDS", "3600")
 )
 
 # How many accounts one request may try before giving up (1 = no failover).

@@ -47,9 +47,11 @@ from quick.config import (
     QUICK_CREDS_GLOB,
     QUICK_POOL_AVOID_OVERAGE,
     QUICK_POOL_COOLDOWN_SECONDS,
+    QUICK_POOL_MAX_COOLDOWN_SECONDS,
+    QUICK_POOL_OVERAGE_POLICY,
     QUICK_POOL_QUOTA_BUCKET,
 )
-from quick.usage_watch import UsageSnapshot, snapshot_for
+from quick.usage_watch import UsageSnapshot, restore_snapshots, snapshot_for
 
 DEFAULT_ACCOUNT: str = "default"
 _CREDS_STEM: str = "gateway-creds"
@@ -63,6 +65,27 @@ _COOLDOWN_BY_KIND: Dict[str, int] = {
     "error": 60,                            # transient backend failure
     "auth": 120,                            # token refresh hiccup (not invalid_grant)
 }
+
+
+_OVERAGE_POLICIES: Tuple[str, ...] = ("allow", "avoid")
+
+
+def overage_policy() -> str:
+    """The active overage *preference* (validated, honouring the legacy switch).
+
+    It is a preference, never an eviction: ``avoid`` reorders selection so a spent
+    account is picked last, but an account is only taken out of the pool when it
+    genuinely stops working.
+
+    Returns:
+        ``avoid`` (default) or ``allow``.
+    """
+    policy = QUICK_POOL_OVERAGE_POLICY
+    if policy not in _OVERAGE_POLICIES:
+        return "avoid"
+    if policy == "allow" and QUICK_POOL_AVOID_OVERAGE:
+        return "avoid"
+    return policy
 
 
 def account_name_for(path: Path) -> str:
@@ -169,12 +192,47 @@ class Account:
         return not self.disabled_reason and not self.cooling(now)
 
     def status(self, now: Optional[float] = None) -> str:
-        """One-word state for logs and the status page."""
+        """One-word state for logs and the status page.
+
+        Being on overage is **not** a state: an account leaves the pool only when it
+        actually stops working (a real failure, or the backend saying so). Overage
+        only reorders :meth:`QuickPool.select`.
+        """
         if self.disabled_reason:
             return "disabled"
         if self.cooling(now):
             return "cooling"
         return "ready"
+
+    def monthly_exhausted(self) -> bool:
+        """True when this account's monthly entitlement is spent.
+
+        Unknown (no reading yet) counts as *not* exhausted — an unmeasured account
+        must still get its first request, which is what produces the reading.
+        """
+        usage = self.usage
+        if usage is None:
+            return False
+        if usage.monthly_available_units is not None:
+            return usage.monthly_available_units <= 0
+        return usage.monthly_used_pct is not None and usage.monthly_used_pct >= 100
+
+    def on_overage(self) -> bool:
+        """True when serving here spends overage instead of the subscription.
+
+        Requires overage to be *enabled*: with it off, a spent account is blocked by
+        Quick rather than billed, and :meth:`QuickPool.observe_usage` benches it.
+        """
+        usage = self.usage
+        return bool(usage and usage.overage_enabled) and self.monthly_exhausted()
+
+    def eligible(self, now: Optional[float] = None) -> bool:
+        """Whether the account may serve traffic (alias of :meth:`available`).
+
+        Overage deliberately does not enter here: an account that still works stays
+        selectable, however it is billed.
+        """
+        return self.available(now)
 
     def session_remaining(self) -> Optional[float]:
         """Remaining share of the rolling session allowance, if known."""
@@ -222,6 +280,10 @@ class QuickPool:
         Returns:
             The accounts, ordered by name with ``default`` first.
         """
+        # Readings survive a restart (the pool would otherwise be blind to overage and
+        # spent units for the first requests after every deploy).
+        restore_snapshots()
+
         if force:
             self._accounts = {}
 
@@ -297,10 +359,20 @@ class QuickPool:
         ]
         if not candidates:
             return None
+
+        # Overage decides the ORDER, never the membership: while some account still
+        # has subscription headroom, a spent one is picked last — but if it is the
+        # only one left it still serves. (As a mere sort key it only won inside the
+        # same session bucket, which is exactly the case where both look equally
+        # good and only the money differs.)
+        if overage_policy() != "allow":
+            with_headroom = [a for a in candidates if not a.on_overage()]
+            if with_headroom:
+                candidates = with_headroom
+
         candidates.sort(
             key=lambda a: (
                 -_bucket(a.session_remaining(), width),
-                -_bucket(a.monthly_remaining(), width) if QUICK_POOL_AVOID_OVERAGE else 0,
                 a.inflight,
                 a.served,
                 a.name != DEFAULT_ACCOUNT,   # perfect tie: same order as accounts()
@@ -351,9 +423,48 @@ class QuickPool:
                 "Quick pool: account '{}' DISABLED — {}", account.name, account.last_error
             )
             return kind
-        seconds = cooldown_seconds if cooldown_seconds is not None else _COOLDOWN_BY_KIND.get(kind, 60)
+        # Cross-reference the free entitlement reading rather than trusting the error
+        # text. When the monthly bucket is spent, ANY failure is that block however the
+        # backend worded it — and we have never seen its wording, because these accounts
+        # have always had overage on. Keyword-matching alone would retry a month-long
+        # block every 60 s, and each retry costs a real request its first attempt.
+        if kind != "quota" and account.monthly_exhausted():
+            logger.info(
+                "Quick pool: treating '{}' failure on account '{}' as a quota block "
+                "(monthly entitlement is spent).", kind, account.name,
+            )
+            kind = "quota"
+        if kind == "quota" and account.monthly_exhausted():
+            usage = account.usage
+            self.cool_down_until(
+                account, usage.monthly_resets_at if usage else None,
+                "monthly entitlement spent",
+            )
+            return kind
+
+        seconds = (
+            cooldown_seconds if cooldown_seconds is not None
+            else self._backoff(kind, account.failures)
+        )
         self.cool_down(account, seconds, kind)
         return kind
+
+    @staticmethod
+    def _backoff(kind: str, failures: int) -> float:
+        """Cooldown for a failure kind, doubled per consecutive failure and capped.
+
+        Without this a permanently broken account is retried at a fixed interval
+        forever, and every retry spends a real request's first attempt on it.
+
+        Args:
+            kind: Failure kind from :func:`classify_failure`.
+            failures: Consecutive failures on the account (reset by a success).
+
+        Returns:
+            Seconds to stay out of rotation.
+        """
+        base = _COOLDOWN_BY_KIND.get(kind, 60)
+        return float(min(base * 2 ** max(0, failures - 1), QUICK_POOL_MAX_COOLDOWN_SECONDS))
 
     def cool_down(self, account: Account, seconds: float, reason: str) -> None:
         """Put an account out of rotation for ``seconds`` (never shortens a longer rest)."""
@@ -366,6 +477,19 @@ class QuickPool:
             "Quick pool: account '{}' cooling down {}s ({}).",
             account.name, int(seconds), reason,
         )
+
+    def cool_down_until(self, account: Account, epoch: Optional[int], reason: str) -> None:
+        """Bench an account until an absolute deadline (e.g. the monthly reset).
+
+        Args:
+            account: The account to bench.
+            epoch: Unix timestamp to sleep until; falsy falls back to the quota default.
+            reason: Shown on the status page.
+        """
+        if not epoch:
+            self.cool_down(account, _COOLDOWN_BY_KIND["quota"], reason)
+            return
+        self.cool_down(account, max(0.0, epoch - time.time()), reason)
 
     def revive(self, account: Account) -> None:
         """Clear a disable/cooldown (used after a credential file is replaced)."""
@@ -397,6 +521,11 @@ class QuickPool:
         elif snapshot.session_remaining_pct is not None and snapshot.session_remaining_pct <= 0:
             seconds = (snapshot.resume_in_minutes * 60) or _COOLDOWN_BY_KIND["quota"]
             self.cool_down(account, seconds, "session allowance exhausted")
+        # A spent monthly bucket is deliberately NOT benched here, even with overage
+        # off. "It will surely be blocked" is a guess about a rejection we have never
+        # observed, and acting on it would take a working account out of the pool.
+        # Let the backend be the arbiter: if the next request really is refused,
+        # note_failure benches it — and uses this reading to size the cooldown.
 
     # ------------------------------------------------------------------ reporting
 
@@ -421,6 +550,7 @@ class QuickPool:
                 "monthly_provisioned_units": usage.monthly_provisioned_units if usage else None,
                 "monthly_resets_at": usage.monthly_resets_at if usage else None,
                 "overage_enabled": bool(usage.overage_enabled) if usage else False,
+                "on_overage": account.on_overage(),
                 "entitlement_status": usage.entitlement_status if usage else "",
                 "reading_age_seconds": round(usage.age_seconds(), 1) if usage else None,
                 "inflight": account.inflight,
@@ -438,6 +568,7 @@ class QuickPool:
             "total": len(accounts),
             "ready": len(ready),
             "pool_remaining_pct": round(sum(known) / len(known), 1) if known else None,
+            "overage_policy": overage_policy(),
             "generated_at": now,
         }
 
@@ -449,4 +580,4 @@ pool = QuickPool()
 def selectable_names(accounts: Sequence[Account]) -> List[str]:
     """Names of the accounts currently able to serve traffic (for logs)."""
     now = time.time()
-    return [a.name for a in accounts if a.available(now)]
+    return [a.name for a in accounts if a.eligible(now)]

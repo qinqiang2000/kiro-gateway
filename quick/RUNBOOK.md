@@ -184,6 +184,33 @@ one 1-token request (haiku) to refresh the reading — so the CLI needs creds, i
 it in the container, not on the mac. Background: `quick/README.md` → "Watching the
 session allowance".
 
+## 8b. 账号不可用时会发生什么（额度/账单守护）
+
+不需要健康探针 —— 探针要花的正是想省的额度。检测走两条免费信号：
+
+**只有真的不通才移出。** 不做健康探针（探针要花的正是想省的额度），也不做"预判它会被拦"
+（月度用尽 ≠ 不通：这些账号在 0 units 下一直正常服务）。
+
+- **触发**：只有后端说了才算 —— 真实请求失败，或读数里 Quick 自己说不行
+  （`entitlementStatus != ALLOWED`、会话余量 0%）。请求本身自动 failover 到下一个账号（用户无感）。
+- **时长**：真的失败之后，用免费的 `usageSummary`（`resetsAt` / `resumeInMinutes`）算冷却多久，
+  而不是拍一个常数。重复失败按 2 倍退避，封顶 `QUICK_POOL_MAX_COOLDOWN_SECONDS`（1 h）。
+- **恢复**：冷却是绝对期限，到期后的第一个真实请求就是半开试探 —— 成功清零，失败按下一档退避。
+  冷却中的账号会跳过每小时那次探针。
+
+**别信错误文案（但要先真的失败过）**：账号月度耗尽时，任何失败都按配额封锁处理（后端在这种
+情况下的措辞我们从没见过 —— 这些账号一直开着 overage）。只靠关键字匹配会让一个持续到月底的
+封锁每 60 秒重试一次。
+
+**`QUICK_POOL_OVERAGE_POLICY` 只管顺序，不管去留**：`avoid`（默认，只要还有账号有月度余量，
+超额账号排最后）/ `allow`（只按会话余量排）。超额账号即使是最后一个也照样服务，池子不会
+为了省钱返回 503。要硬停就在**账号侧关掉 overage**，让 Quick 自己拦 —— 那时是真的不通，
+池子按普通失败处理。
+
+```bash
+docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch --json  # 每个账号的 units/状态
+```
+
 ## 9. Trouble
 
 - Startup "No Kiro credentials" → set `REFRESH_TOKEN` (any value) in the compose.

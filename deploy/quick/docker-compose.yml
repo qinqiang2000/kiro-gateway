@@ -37,6 +37,9 @@ services:
       - QUICK_CREDS_DIR=/home/kiro/.quickwork
       # Pool: how many accounts one request may try before giving up.
       - QUICK_POOL_MAX_ATTEMPTS=2
+      # Prefer the account that still has monthly units; a spent one is picked last
+      # but never dropped from the pool. See quick/README.md "Overage preference".
+      - QUICK_POOL_OVERAGE_POLICY=avoid
       # Force every request to the best authorized Opus (opus-5 is IAM-denied).
       - QUICK_FORCE_MODEL=us.anthropic.claude-opus-4-8
       # Model watch: poll Quick's PUBLIC model registry every 5 h and alert on a

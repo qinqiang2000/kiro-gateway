@@ -9,6 +9,7 @@ conventions.
 
 import json
 import struct
+import time
 
 import pytest
 
@@ -785,14 +786,15 @@ class TestAlertDeliveryErrors:
 # Session-usage watch (quick/usage_watch.py)
 # ==================================================================================================
 
-def _usage_summary(session_used, monthly_used=100, resume=0, status="ALLOWED"):
+def _usage_summary(session_used, monthly_used=100, resume=0, status="ALLOWED",
+                   overage=True, units=0, provisioned=720, resets_at=1788220800):
     """Build a usageSummary exactly as the live DataPlane returns it."""
     return {
         "entitlementStatus": status,
-        "overageEnabled": True,
+        "overageEnabled": overage,
         "sessionUsage": {"resumeInMinutes": resume, "usedPercentage": session_used},
-        "monthlyUsage": {"availableUnits": 0, "provisionedUnits": 720,
-                         "resetsAt": 1788220800, "usedPercentage": monthly_used},
+        "monthlyUsage": {"availableUnits": units, "provisionedUnits": provisioned,
+                         "resetsAt": resets_at, "usedPercentage": monthly_used},
     }
 
 
@@ -1445,3 +1447,250 @@ class TestCachePointEdgeCases:
             aggregator.add(event)
 
         assert aggregator.result()["usage"] == {"input_tokens": 9, "output_tokens": 2}
+
+
+# ==================================================================================================
+# Pool: quota-block eviction and the overage admission policy
+# ==================================================================================================
+
+@pytest.fixture
+def policy(monkeypatch):
+    """Set the pool's overage policy for one test."""
+    import quick.pool as qp
+
+    def _set(value):
+        monkeypatch.setattr(qp, "QUICK_POOL_OVERAGE_POLICY", value)
+        monkeypatch.setattr(qp, "QUICK_POOL_AVOID_OVERAGE", False)
+    return _set
+
+
+class TestOveragePolicy:
+    def test_unknown_setting_falls_back_to_avoid_not_allow(self, policy):
+        from quick.pool import overage_policy
+
+        policy("sure-why-not")
+
+        assert overage_policy() == "avoid"
+
+    def test_never_is_not_a_policy_any_more(self, policy):
+        from quick.pool import overage_policy
+
+        policy("never")
+
+        assert overage_policy() == "avoid"
+
+    def test_legacy_switch_still_forces_avoid(self, monkeypatch):
+        import quick.pool as qp
+
+        monkeypatch.setattr(qp, "QUICK_POOL_OVERAGE_POLICY", "allow")
+        monkeypatch.setattr(qp, "QUICK_POOL_AVOID_OVERAGE", True)
+
+        assert qp.overage_policy() == "avoid"
+
+
+class TestOveragePreference:
+    """Overage decides the order, never the membership."""
+
+    def test_prefers_headroom_even_with_less_session_left(self, pool_env, policy):
+        policy("avoid")
+        # 'default' looks better on the session meter but every unit it serves is billed.
+        _reading("default", 10, monthly_used=100, units=0, overage=True)
+        _reading("b", 60, monthly_used=20, units=576, overage=True)
+
+        assert pool_env.select().name == "b"
+
+    def test_a_spent_account_still_serves_when_it_is_the_only_one(self, pool_env, policy):
+        policy("avoid")
+        _reading("default", 10, monthly_used=100, units=0, overage=True)
+        _reading("b", 50, monthly_used=100, units=0, overage=True)
+
+        assert pool_env.select() is not None
+
+    def test_overage_never_changes_an_account_status(self, pool_env, policy):
+        policy("avoid")
+        _reading("default", 10, monthly_used=100, units=0, overage=True)
+
+        account = pool_env.get("default")
+
+        assert account.status() == "ready"
+        assert account.eligible() is True
+        assert account.cooling() is False
+
+    def test_allow_ranks_purely_on_the_session_allowance(self, pool_env, policy):
+        policy("allow")
+        _reading("default", 10, monthly_used=100, units=0, overage=True)
+        _reading("b", 60, monthly_used=20, units=576, overage=True)
+
+        # 90 % session left beats 40 %, whoever pays for it.
+        assert pool_env.select().name == "default"
+
+    def test_an_unmeasured_account_is_not_treated_as_on_overage(self, pool_env, policy):
+        policy("avoid")
+
+        assert pool_env.select() is not None
+
+
+class TestOnlyRealFailureEvicts:
+    """A reading may size a cooldown; only the backend may start one."""
+
+    def test_spent_units_without_overage_are_not_benched_preemptively(self, pool_env):
+        import quick.usage_watch as uw
+
+        _reading("default", 10, monthly_used=100, units=0, overage=False)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        assert pool_env.get("default").cooling() is False
+        assert pool_env.get("default").status() == "ready"
+
+    def test_spent_account_with_overage_stays_healthy(self, pool_env):
+        import quick.usage_watch as uw
+
+        _reading("default", 10, monthly_used=100, units=0, overage=True)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        assert pool_env.get("default").cooling() is False
+
+    def test_the_backend_saying_no_still_benches(self, pool_env):
+        import quick.usage_watch as uw
+
+        _reading("default", 10, status="BLOCKED")
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        assert pool_env.get("default").cooling() is True
+
+    def test_an_exhausted_session_still_benches(self, pool_env):
+        import quick.usage_watch as uw
+
+        _reading("default", 100, resume=30)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+        account = pool_env.get("default")
+
+        assert account.cooling() is True
+        assert 1500 < account.cooldown_until - time.time() <= 1800
+
+
+class TestFailureCrossReference:
+    """The entitlement reading decides, not the backend's choice of words."""
+
+    def test_unrecognised_error_on_a_spent_account_is_a_quota_block(self, pool_env):
+        resets = int(time.time()) + 7200
+        _reading("default", 10, monthly_used=100, units=0, overage=False, resets_at=resets)
+        account = pool_env.get("default")
+
+        kind = pool_env.note_failure(account, 400, "Request blocked by policy 8f21c")
+
+        assert kind == "quota"
+        assert account.cooldown_until - time.time() > 3600
+
+    def test_same_error_on_a_healthy_account_stays_a_short_cooldown(self, pool_env):
+        _reading("b", 10, monthly_used=20, units=576, overage=False)
+        account = pool_env.get("b")
+
+        kind = pool_env.note_failure(account, 400, "Request blocked by policy 8f21c")
+
+        assert kind == "error"
+        assert account.cooldown_until - time.time() <= 60
+
+
+class TestFailureBackoff:
+    def test_repeated_failures_double_the_cooldown(self, pool_env):
+        account = pool_env.get("b")
+
+        pool_env.note_failure(account, 502, "boom")
+        first = account.cooldown_until
+        account.cooldown_until = 0.0          # let the next one take effect
+        pool_env.note_failure(account, 502, "boom")
+        second = account.cooldown_until
+
+        assert (second - time.time()) > (first - time.time()) * 1.8
+
+    def test_backoff_is_capped(self, pool_env, monkeypatch):
+        import quick.pool as qp
+
+        monkeypatch.setattr(qp, "QUICK_POOL_MAX_COOLDOWN_SECONDS", 300)
+        account = pool_env.get("b")
+        account.failures = 20
+        account.cooldown_until = 0.0
+
+        pool_env.note_failure(account, 502, "boom")
+
+        assert account.cooldown_until - time.time() <= 300
+
+    def test_a_success_resets_the_streak(self, pool_env):
+        account = pool_env.get("b")
+        account.failures = 5
+
+        pool_env.note_success(account)
+        account.cooldown_until = 0.0
+        pool_env.note_failure(account, 502, "boom")
+
+        assert account.cooldown_until - time.time() <= 60
+
+
+class TestWarmStart:
+    """Readings survive a restart, or the money guard is blind right after a deploy."""
+
+    def test_persisted_readings_are_restored_into_memory(self, tmp_path, monkeypatch):
+        import quick.usage_watch as uw
+
+        state = {"accounts": {"b": {"armed": True, "last": {
+            "session_used_pct": 40.0, "session_remaining_pct": 60.0,
+            "resume_in_minutes": 0, "monthly_used_pct": 100.0,
+            "monthly_available_units": 0.0, "monthly_provisioned_units": 720.0,
+            "monthly_resets_at": 1788220800, "entitlement_status": "ALLOWED",
+            "overage_enabled": True, "observed_at": 1.0, "age_seconds": 999.0,
+        }}}}
+        path = tmp_path / "session-usage-state.json"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(uw, "QUICK_SESSION_WATCH_STATE", path)
+        uw._snapshots.clear()
+        monkeypatch.setattr(uw, "_restored", False)
+
+        assert uw.restore_snapshots() == 1
+        snap = uw.snapshot_for("b")
+        assert snap.session_remaining_pct == 60.0
+        assert snap.overage_enabled is True
+        # The extra to_dict() key must not blow up the constructor.
+        assert snap.monthly_available_units == 0.0
+        # Restored readings keep their age, so the next cycle still refreshes them.
+        assert snap.age_seconds() > 1000
+
+    def test_restoring_twice_is_a_no_op(self, tmp_path, monkeypatch):
+        import quick.usage_watch as uw
+
+        path = tmp_path / "session-usage-state.json"
+        path.write_text(json.dumps({"accounts": {}}), encoding="utf-8")
+        monkeypatch.setattr(uw, "QUICK_SESSION_WATCH_STATE", path)
+        monkeypatch.setattr(uw, "_restored", False)
+
+        uw.restore_snapshots()
+
+        assert uw.restore_snapshots() == 0
+
+    def test_a_corrupt_entry_does_not_stop_the_others(self, tmp_path, monkeypatch):
+        import quick.usage_watch as uw
+
+        state = {"accounts": {
+            "bad": {"last": {"nonsense": 1}},
+            "good": {"last": {"session_used_pct": 10.0, "session_remaining_pct": 90.0}},
+        }}
+        path = tmp_path / "session-usage-state.json"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(uw, "QUICK_SESSION_WATCH_STATE", path)
+        uw._snapshots.clear()
+        monkeypatch.setattr(uw, "_restored", False)
+
+        uw.restore_snapshots()
+
+        assert uw.snapshot_for("good").session_remaining_pct == 90.0
+
+
+class TestPoolExhaustedMessage:
+    def test_a_cooldown_still_shows_its_own_reason(self, pool_env, policy):
+        from quick.routes import _pool_exhausted_message
+
+        policy("avoid")
+        pool_env.cool_down(pool_env.get("default"), 300, "session allowance exhausted")
+        pool_env.cool_down(pool_env.get("b"), 300, "session allowance exhausted")
+
+        assert "session allowance exhausted" in _pool_exhausted_message("")

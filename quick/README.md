@@ -102,9 +102,11 @@ pinning by default**: pinning starves one account while the others idle, and tak
 the key down with it.
 
 1. drop accounts that are disabled or cooling down;
-2. rank by remaining session share, **bucketed** to 10 % (`QUICK_POOL_QUOTA_BUCKET`) —
+2. apply the **overage preference** (below) — while some account still has monthly
+   units, a spent one is ordered last (it is never dropped);
+3. rank by remaining session share, **bucketed** to 10 % (`QUICK_POOL_QUOTA_BUCKET`) —
    ranking on the raw percentage would ping-pong the choice on every reading;
-3. break ties by in-flight requests, then by requests served — round-robin within a
+4. break ties by in-flight requests, then by requests served — round-robin within a
    bucket, which also spreads the first requests before any reading exists.
 
 An unmeasured account counts as full, so a freshly added one gets the first request
@@ -128,7 +130,8 @@ belongs to the client and the error is surfaced as-is.
 |-----------|--------|
 | `entitlementStatus != ALLOWED` | cooldown (`QUICK_POOL_COOLDOWN_SECONDS`, default 15 min) |
 | session allowance at 0 % | cooldown until the window resets |
-| 429 / IAM deny / backend error | cooldown 5 min / 5 min / 1 min |
+| 429 / IAM deny / backend error | cooldown 5 min / 5 min / 1 min, **doubling per consecutive failure** up to `QUICK_POOL_MAX_COOLDOWN_SECONDS` (1 h) |
+| a **real failure** while the monthly bucket is spent | re-classified as a quota block → cooldown until `resetsAt` |
 | Keycloak `invalid_grant` on refresh | **disabled** + one alert — only a re-uploaded creds file fixes it |
 
 > `resumeInMinutes` is **not** a lockout timer — it counts down to the rolling
@@ -136,6 +139,48 @@ belongs to the client and the error is surfaced as-is.
 > (verified live: 21 % left, `resumeInMinutes` 55, `entitlementStatus` ALLOWED). It
 > only sizes the cooldown once the allowance really is exhausted. A merely *low*
 > account needs no special case: selection already ranks it below its siblings.
+
+**Only a real failure evicts. Detection is by real traffic — never by a health probe,
+and never by predicting a rejection we have not seen.** A prober would spend the very
+quota this protects, and it exercises a different path than real requests (a haiku
+probe passing says nothing about Opus). A prediction is worse still: benching a
+working account on the guess that Quick *would* block it costs capacity for nothing.
+
+* **the trigger is the backend** — a request that fails, or a reading in which Quick
+  itself says the account is blocked (`entitlementStatus != ALLOWED`, session at 0 %).
+  A spent monthly bucket is **not** a trigger, with or without overage: Quick has
+  served every request we have ever sent at 0 units;
+* **the reading sizes the rest** — once something really fails, the free
+  `usageSummary` decides how long to wait (`resetsAt`, `resumeInMinutes`) instead of
+  a made-up constant, and the request itself fails over to the next candidate;
+* **coming back** — the cooldown is an absolute deadline and the first request after
+  it expires *is* the half-open trial: it either succeeds (streak cleared) or re-cools
+  with the next backoff step. The hourly `usage_watch` cycle skips its probe for a
+  benched account precisely so it does not spend a failing request per hour.
+
+> **Trust the reading over the error text — but only after something failed.** When an
+> account's monthly bucket is spent, *any* failure is that block however the backend
+> words it (we have never seen the wording, because these accounts have always had
+> overage on). Keyword-matching alone would retry a month-long block every 60 s.
+
+### Overage preference
+
+`QUICK_POOL_OVERAGE_POLICY` decides the **order**, never the membership, for an
+account whose monthly entitlement is spent (so Quick serves it on overage):
+
+| value | behaviour |
+|-------|-----------|
+| `avoid` *(default)* | pick it last, while any account still has monthly headroom |
+| `allow` | ignore the distinction and rank purely on the session allowance |
+
+An unrecognised value falls back to `avoid`. The deprecated
+`QUICK_POOL_AVOID_OVERAGE=1` still forces `avoid`.
+
+A spent account that is the only one left **still serves the request** — the pool
+never answers 503 over money. If you want a hard stop, turn overage off on the
+account itself: Quick then enforces it, and the pool reacts to the real rejection
+like any other failure. `snapshot()` reports `on_overage` per account so the status
+page can show who is spending, without that ever reading as "broken".
 
 ### Pinning (the escape hatch)
 
