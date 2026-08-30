@@ -128,8 +128,33 @@ QUICK_STATUS_HOST: str = os.getenv("QUICK_STATUS_HOST", "0.0.0.0")
 QUICK_STATUS_PATH: str = os.getenv("QUICK_STATUS_PATH", "/quick")
 
 # Optional shared secret. Empty (default) = the page is public. When set, requests
-# must carry ?t=<token> or the X-Status-Token header.
+# must carry ?t=<token> or the X-Status-Token header. REQUIRED once the page shows
+# anything that identifies people (account files named after their owner, litellm key
+# aliases) — the port is published to the internet.
 QUICK_STATUS_TOKEN: str = os.getenv("QUICK_STATUS_TOKEN", "")
+
+# ==================================================================================================
+# litellm spend (the status page's second tab)
+# ==================================================================================================
+
+# Where litellm lives. quick-gateway shares `kiro-gateway-network` with it, so the
+# container name resolves; the master key is what its admin endpoints require.
+LITELLM_BASE_URL: str = os.getenv("LITELLM_BASE_URL", "http://litellm:4000").rstrip("/")
+
+# Secret — .env only, never committed (this repo is public). Empty = the tab is off.
+LITELLM_MASTER_KEY: str = os.getenv("LITELLM_MASTER_KEY", "")
+
+# Which litellm model names count as "this channel". litellm records the *resolved*
+# model (`anthropic/claude-opus-quick`) on a successful call and the requested name
+# (`claude-opus-quick`) on a failed one, so both are queried and merged.
+LITELLM_QUICK_MODELS: str = os.getenv(
+    "LITELLM_QUICK_MODELS", "anthropic/claude-opus-quick,claude-opus-quick"
+)
+
+# The spend query walks a month of daily rows, so it is cached rather than run per
+# page load (the page polls every 20 s).
+LITELLM_USAGE_CACHE_SECONDS: int = int(os.getenv("LITELLM_USAGE_CACHE_SECONDS", "300"))
+LITELLM_USAGE_TIMEOUT: float = float(os.getenv("LITELLM_USAGE_TIMEOUT", "20"))
 
 # ==================================================================================================
 # Token refresh (Keycloak OIDC)

@@ -262,25 +262,65 @@ python -m quick.usage_watch --account b --json    # one account
 
 ## Status page (`status_app.py`)
 
-A read-only page showing each account's remaining quota, served on
-`QUICK_STATUS_PORT` (default 9090) under `QUICK_STATUS_PATH` (default `/quick`) —
-**a separate ASGI app on a separate port**, and that is the point: publishing the
-gateway's own port would expose `/quick/v1/messages`, i.e. hand the pool's quota to
-the internet. This app has two routes (the page and its `…/api/pool`) and no
-inference path; **everything else answers a bare 404**, so a scanner sweeping `/`
-finds nothing. That is obscurity, not a boundary — `QUICK_STATUS_TOKEN` is the
-boundary.
+A read-only page with two tabs, served on `QUICK_STATUS_PORT` (default 9090) under
+`QUICK_STATUS_PATH` (default `/quick`) — **a separate ASGI app on a separate port**,
+and that is the point: publishing the gateway's own port would expose
+`/quick/v1/messages`, i.e. hand the pool's quota to the internet. This app has three
+routes (the page and its two JSON endpoints) and no inference path; **everything else
+answers a bare 404**, so a scanner sweeping `/` finds nothing. That is obscurity, not
+a boundary — `QUICK_STATUS_TOKEN` is the boundary.
 
-It renders no credential material — no token, tenant URL, user ARN or e-mail, only
-the labels derived from *filenames* plus Quick's own numbers. Name the files
-neutrally (`b`, `c`) if the page is public and the humans behind the accounts should
-not be. Set `QUICK_STATUS_TOKEN` to require `?t=<token>`; leave it empty for an open
-page. `QUICK_STATUS_PORT=0` disables the server.
+| tab | question it answers | source |
+|-----|---------------------|--------|
+| 账号额度 | how much Quick allowance is left, per account | the pool's own readings |
+| 本月花费排名 | **which virtual key spent it**, this month | litellm (`litellm_usage.py`) |
+
+It renders no credential material — no token, tenant URL, user ARN, and never a key,
+only labels: account names come from *filenames*, spender names are litellm **key
+aliases**. Both identify people once you name them after their owners, which is why
+this deployment sets `QUICK_STATUS_TOKEN` (require `?t=<token>` or an
+`X-Status-Token` header). Name things neutrally (`b`, `c`) instead if the page must
+stay open. `QUICK_STATUS_PORT=0` disables the server.
 
 ```
-http://<box>:9090/quick            # the page
-http://<box>:9090/quick/api/pool   # the same data as JSON
+http://<box>:9090/quick?t=<token>              # the page
+http://<box>:9090/quick/api/pool?t=<token>     # account quota, as JSON
+http://<box>:9090/quick/api/litellm?t=<token>  # this month's spend ranking, as JSON
 ```
+
+### The spend tab (`litellm_usage.py`)
+
+quick-gateway cannot attribute a request to a person — litellm is the auth boundary,
+so the gateway never sees a client key. litellm can, and the tab reads it from
+`GET /user/daily/activity`, the endpoint litellm's own Usage UI calls. It is the only
+one that gives per-key **and** per-model numbers on a community licence:
+`/global/spend/report` is enterprise-gated (403 with a licence pitch) and
+`/global/spend/keys` is per-key but all-models with no token counts.
+
+Two things had to be read off real rows to get it right:
+
+* litellm records the **resolved** model (`anthropic/claude-opus-quick`) on a success
+  and the **requested** one (`claude-opus-quick`) on a failure, so both names are
+  queried and merged (`LITELLM_QUICK_MODELS`) — otherwise a month of 429s during a
+  quota block would vanish from the ranking;
+* `breakdown.api_keys` is scoped by whatever filter the query carried. The per-key
+  numbers are only this channel's *because* `model=` was passed; reading the same
+  field off an unfiltered query would report each key's spend across every model in
+  the proxy.
+
+The dollar figures are litellm's accounting at its configured rates (quick is priced
+at 1/10 of official Opus list), **not** an AWS invoice — the Quick seats are flat-rate
+with a unit quota. The page says so, because a ranking in dollars invites the opposite
+reading. The report is cached for `LITELLM_USAGE_CACHE_SECONDS` (the page polls every
+20 s and the query walks a month of daily rows), and a failed refresh serves the last
+good ranking marked stale rather than blanking the tab.
+
+| env | meaning |
+|-----|---------|
+| `LITELLM_MASTER_KEY` | litellm admin key. **Secret — `.env` only, this repo is public.** Empty = tab off |
+| `LITELLM_BASE_URL` | where litellm lives (default `http://litellm:4000`, over the shared docker network) |
+| `LITELLM_QUICK_MODELS` | model names that count as this channel (default `anthropic/claude-opus-quick,claude-opus-quick`) |
+| `LITELLM_USAGE_CACHE_SECONDS` | how long a report is served before re-querying (300) |
 
 ## Confirmed protocol
 
@@ -330,7 +370,8 @@ stream path and aggregates for non-streaming responses.
 | `model_watch.py` | watch the public model registry, alert on a newer Opus |
 | `usage_watch.py` | per-account allowance readings, alert once when one runs low |
 | `pool.py` | the account pool: discovery, quota-aware selection, cooldown/failover |
-| `status_app.py` | public read-only quota page (own port, no inference route) |
+| `status_app.py` | read-only status page: quota + spend tabs (own port, no inference route) |
+| `litellm_usage.py` | this channel's per-key monthly spend, read from litellm's usage API |
 | `agent_loop.py` | model↔web_search loop (Path B): run, search, feed back, repeat |
 | `routes.py` | FastAPI `/quick/v1/messages`, `/quick/pin/{account}/…`, `/quick/pool` |
 

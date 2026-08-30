@@ -11,6 +11,7 @@ import json
 import struct
 import time
 
+import httpx
 import pytest
 
 import quick.config
@@ -1463,7 +1464,7 @@ class TestStatusPageSafety:
 
         paths = {r.path for r in create_status_app().routes}
 
-        assert paths == {"/quick", "/quick/", "/quick/api/pool"}
+        assert paths == {"/quick", "/quick/", "/quick/api/pool", "/quick/api/litellm"}
 
     def test_everything_outside_the_prefix_is_404(self):
         from fastapi.testclient import TestClient
@@ -1480,7 +1481,226 @@ class TestStatusPageSafety:
 
         paths = {r.path for r in create_status_app("/pool-abc").routes}
 
-        assert paths == {"/pool-abc", "/pool-abc/", "/pool-abc/api/pool"}
+        assert paths == {"/pool-abc", "/pool-abc/", "/pool-abc/api/pool",
+                         "/pool-abc/api/litellm"}
+
+    def test_the_spend_api_is_behind_the_same_token(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        import quick.status_app as sa
+
+        monkeypatch.setattr(sa, "QUICK_STATUS_TOKEN", "s3cret")
+        client = TestClient(sa.create_status_app())
+
+        assert client.get("/quick/api/litellm").status_code == 404
+        assert client.get("/quick/api/litellm?t=nope").status_code == 404
+
+
+# ==================================================================================================
+# litellm spend ranking (quick/litellm_usage.py)
+# ==================================================================================================
+
+def _activity_day(date_str: str, keys: dict) -> dict:
+    """One /user/daily/activity result row, shaped like the live endpoint's."""
+    return {
+        "date": date_str,
+        "metrics": {},
+        "breakdown": {
+            "api_keys": {
+                h: {"metrics": m, "metadata": {"key_alias": alias, "team_id": None}}
+                for h, (alias, m) in keys.items()
+            }
+        },
+    }
+
+
+def _metrics(spend=0.0, total=0, prompt=0, completion=0, cache_read=0,
+             requests=0, ok=0, failed=0) -> dict:
+    """A metrics block with only the fields the aggregator reads."""
+    return {"spend": spend, "total_tokens": total, "prompt_tokens": prompt,
+            "completion_tokens": completion, "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": 0, "api_requests": requests,
+            "successful_requests": ok, "failed_requests": failed}
+
+
+@pytest.fixture
+def litellm_env(monkeypatch):
+    """Point the spend module at a fake litellm and clear its cache."""
+    import quick.litellm_usage as lu
+
+    monkeypatch.setattr(lu, "LITELLM_MASTER_KEY", "sk-test")
+    monkeypatch.setattr(lu, "LITELLM_QUICK_MODELS", "anthropic/quick,quick")
+    monkeypatch.setattr(lu, "LITELLM_USAGE_CACHE_SECONDS", 300)
+    lu.reset_cache()
+    yield lu
+    lu.reset_cache()
+
+
+def _fake_litellm(monkeypatch, lu, by_model: dict, calls: list = None):
+    """Install an AsyncClient that answers /user/daily/activity from ``by_model``."""
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None, **k):
+            if calls is not None:
+                calls.append(params)
+            return _Resp(by_model.get((params or {}).get("model"), {"results": [],
+                                                                    "metadata": {}}))
+
+    monkeypatch.setattr(lu.httpx, "AsyncClient", _Client)
+
+
+class TestLitellmSpendSuccess:
+    @pytest.mark.asyncio
+    async def test_keys_are_ranked_by_spend(self, litellm_env, monkeypatch):
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {
+                    "hash_a": ("张三", _metrics(spend=1.0, total=100, requests=2, ok=2)),
+                    "hash_b": ("李四", _metrics(spend=4.0, total=900, requests=5, ok=5)),
+                })], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert [k["alias"] for k in report["keys"]] == ["李四", "张三"]
+        assert report["totals"]["spend"] == 5.0
+        assert report["totals"]["total_tokens"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_days_and_models_are_summed_per_key(self, litellm_env, monkeypatch):
+        """A key's two days on the resolved name plus its failures on the requested one."""
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(spend=1.0, total=10,
+                                                                   requests=1, ok=1))}),
+                _activity_day("2026-08-02", {"h": ("张三", _metrics(spend=2.0, total=20,
+                                                                   requests=1, ok=1))}),
+            ], "metadata": {"total_pages": 1}},
+            "quick": {"results": [
+                _activity_day("2026-08-02", {"h": ("张三", _metrics(requests=7, failed=7))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert len(report["keys"]) == 1
+        row = report["keys"][0]
+        assert row["spend"] == 3.0 and row["total_tokens"] == 30
+        assert row["requests"] == 9 and row["failed"] == 7
+
+    @pytest.mark.asyncio
+    async def test_the_query_is_filtered_to_this_channel(self, litellm_env, monkeypatch):
+        """Without model=, breakdown.api_keys would be each key's spend on EVERY model."""
+        calls = []
+        _fake_litellm(monkeypatch, litellm_env, {}, calls)
+
+        await litellm_env.fetch_monthly_spend()
+
+        assert [c["model"] for c in calls] == ["anthropic/quick", "quick"]
+        assert all(c["start_date"].endswith("-01") for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_key_with_no_alias_shows_a_short_hash_not_the_key(self, litellm_env,
+                                                                     monkeypatch):
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {"0123456789abcdef": ("", _metrics(spend=1.0))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert report["keys"][0]["alias"] == "key 01234567"
+        assert "0123456789abcdef" not in json.dumps(report, ensure_ascii=False)
+
+    @pytest.mark.asyncio
+    async def test_a_litellm_service_account_keeps_its_readable_name(self, litellm_env,
+                                                                    monkeypatch):
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {"litellm_proxy_admin": ("", _metrics(spend=1.0))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert report["keys"][0]["alias"] == "litellm_proxy_admin"
+
+    def test_the_window_is_the_calendar_month_so_far(self, litellm_env):
+        import datetime as dt
+
+        start, end, month = litellm_env.month_window(dt.date(2026, 8, 30))
+
+        assert (start, end, month) == ("2026-08-01", "2026-08-30", "2026-08")
+
+
+class TestLitellmSpendErrors:
+    @pytest.mark.asyncio
+    async def test_no_master_key_is_reported_not_raised(self, litellm_env, monkeypatch):
+        monkeypatch.setattr(litellm_env, "LITELLM_MASTER_KEY", "")
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert report["error"] and report["keys"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_refresh_serves_the_last_good_report(self, litellm_env,
+                                                                monkeypatch):
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(spend=1.0))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+        await litellm_env.monthly_spend(force=True)
+
+        async def _boom(*a, **k):
+            raise httpx.ConnectError("litellm down")
+
+        monkeypatch.setattr(litellm_env, "fetch_monthly_spend", _boom)
+        report = await litellm_env.monthly_spend(force=True)
+
+        assert report["stale"] is True
+        assert report["keys"][0]["alias"] == "张三"
+        assert "litellm down" in report["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_first_failure_returns_an_empty_report(self, litellm_env, monkeypatch):
+        async def _boom(*a, **k):
+            raise httpx.ConnectError("litellm down")
+
+        monkeypatch.setattr(litellm_env, "fetch_monthly_spend", _boom)
+        report = await litellm_env.monthly_spend(force=True)
+
+        assert report["keys"] == [] and "litellm down" in report["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_cache_avoids_re_walking_the_month(self, litellm_env, monkeypatch):
+        calls = []
+        _fake_litellm(monkeypatch, litellm_env, {}, calls)
+
+        await litellm_env.monthly_spend()
+        await litellm_env.monthly_spend()
+
+        assert len(calls) == 2          # one per model, from the first call only
 
 
 # ==================================================================================================

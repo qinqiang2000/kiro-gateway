@@ -30,10 +30,15 @@ services:
       - REFRESH_TOKEN=dummy-quick-only
       - PROXY_API_KEY=quick-gw-kingdee-2026
       # Portable Quick creds (scp'd from mac). Container runs as user 'kiro'.
-      # One file per account: gateway-creds.json (=account "default"),
-      # gateway-creds-b.json (="b"), ... Every match becomes a pool member, so
-      # adding an account is "copy one more file in and restart".
-      - QUICK_CREDS_FILE=/home/kiro/.quickwork/gateway-creds.json
+      # One file per account, and the FILENAME IS THE ACCOUNT NAME:
+      # gateway-creds-<name>.json -> account "<name>" (a bare gateway-creds.json
+      # would be "default"). Every match becomes a pool member, so adding an
+      # account is "copy one more file in and restart". Accounts here are named
+      # after the person who owns the Quick seat, which is why the status page
+      # must stay token-gated (QUICK_STATUS_TOKEN below).
+      # This one is only the fallback single-account manager (CLI probes, keep-alive
+      # when the pool is empty), so it must point at a file that actually exists.
+      - QUICK_CREDS_FILE=/home/kiro/.quickwork/gateway-creds-qin_qiang@kingdee.com.json
       - QUICK_CREDS_DIR=/home/kiro/.quickwork
       # Pool: how many accounts one request may try before giving up.
       - QUICK_POOL_MAX_ATTEMPTS=2
@@ -60,7 +65,15 @@ services:
       # Served under this path only; every other path 404s, so a scanner sweeping
       # "/" finds nothing. Obscurity, not a boundary — QUICK_STATUS_TOKEN is that.
       - QUICK_STATUS_PATH=/quick
+      # REQUIRED here: the page's labels are people (account files named after their
+      # owner, litellm key aliases), and 9090 is on the internet.
       - QUICK_STATUS_TOKEN=${QUICK_STATUS_TOKEN:-}
+      # Status page tab 2: which virtual key spent this channel's quota this month.
+      # Read from litellm over the shared docker network; the master key is a secret
+      # and lives in .env only (this repo is public).
+      - LITELLM_BASE_URL=http://litellm:4000
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-}
+      - LITELLM_QUICK_MODELS=anthropic/claude-opus-quick,claude-opus-quick
     volumes:
       - ./quickwork:/home/kiro/.quickwork
     restart: unless-stopped

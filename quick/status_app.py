@@ -7,10 +7,15 @@ separation is the point: publishing the gateway's own port would expose
 ``/quick/v1/messages`` — i.e. hand the account pool's inference quota to the
 internet. This app serves two GET routes and nothing else.
 
-Nothing it renders is a credential: no tokens, no tenant URL, no user ARN, no
-account e-mail — only the labels derived from credential *filenames*, plus the
-quota numbers Quick reports. Name the files neutrally (``b``, ``c``) if the page
-is public and the humans behind the accounts should not be.
+Nothing it renders is a credential: no tokens, no tenant URL, no user ARN — only the
+labels derived from credential *filenames*, the quota numbers Quick reports, and (on
+the spend tab) litellm key **aliases**, never key material.
+
+Those labels do identify people, though, once the credential files are named after
+their owners and the aliases are colleagues' names. So this deployment sets
+:data:`quick.config.QUICK_STATUS_TOKEN`: the port is published to the internet, and
+the path-based 404 is obscurity, not a boundary. Name the files neutrally (``b``,
+``c``) instead if the page must stay open.
 
 The page lives under :data:`quick.config.QUICK_STATUS_PATH` (default ``/quick``) and
 everything else 404s, so a scanner sweeping ``/`` finds nothing. That is obscurity,
@@ -31,6 +36,7 @@ from quick.config import (
     QUICK_STATUS_PORT,
     QUICK_STATUS_TOKEN,
 )
+from quick.litellm_usage import monthly_spend
 from quick.pool import pool
 
 PAGE = """<!DOCTYPE html>
@@ -81,18 +87,59 @@ PAGE = """<!DOCTYPE html>
   .note.bad { color:var(--bad); }
   footer { color:var(--muted); font-size:12px; margin-top:22px; text-align:center; }
   .dim { opacity:.55; }
+  .tabs { display:flex; gap:6px; margin-bottom:16px; }
+  .tabs button { font:inherit; font-size:13.5px; font-weight:600; color:var(--muted);
+                 background:transparent; border:1px solid var(--line); border-radius:999px;
+                 padding:6px 15px; cursor:pointer; transition:all .15s ease; }
+  .tabs button:hover { color:var(--fg); }
+  .tabs button[aria-selected="true"] { background:var(--card); color:var(--fg);
+                                       box-shadow:var(--shadow); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:right; padding:9px 8px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--muted); font-size:12px; font-weight:600; white-space:nowrap; }
+  tbody tr:last-child td { border-bottom:none; }
+  td.num { font-variant-numeric:tabular-nums; }
+  td.who { font-weight:600; }
+  .rank { display:inline-block; min-width:22px; color:var(--muted); font-weight:600;
+          font-variant-numeric:tabular-nums; }
+  .scroll { overflow-x:auto; }
+  .hint { color:var(--muted); font-size:12px; margin-top:10px; line-height:1.6; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Quick 账号池</h1>
-  <div class="sub">各账号剩余额度 · 每 20 秒自动刷新</div>
-  <div class="sum">
-    <div><b id="s-ready">–</b><span>可用账号</span></div>
-    <div><b id="s-avg">–</b><span>平均剩余会话额度</span></div>
-    <div><b id="s-inflight">–</b><span>进行中请求</span></div>
+  <div class="sub" id="sub">各账号剩余额度 · 每 20 秒自动刷新</div>
+  <div class="tabs" role="tablist">
+    <button id="tab-pool" role="tab" aria-selected="true" onclick="show('pool')">账号额度</button>
+    <button id="tab-spend" role="tab" aria-selected="false" onclick="show('spend')">本月花费排名</button>
   </div>
-  <div id="list"></div>
+
+  <div id="pane-pool">
+    <div class="sum">
+      <div><b id="s-ready">–</b><span>可用账号</span></div>
+      <div><b id="s-avg">–</b><span>平均剩余会话额度</span></div>
+      <div><b id="s-inflight">–</b><span>进行中请求</span></div>
+    </div>
+    <div id="list"></div>
+  </div>
+
+  <div id="pane-spend" hidden>
+    <div class="sum">
+      <div><b id="p-spend">–</b><span id="p-month">本月花费</span></div>
+      <div><b id="p-tokens">–</b><span>tokens</span></div>
+      <div><b id="p-reqs">–</b><span>请求数</span></div>
+    </div>
+    <div class="card">
+      <div class="scroll"><table>
+        <thead><tr><th>虚拟 key</th><th>花费</th><th>tokens</th><th>缓存读取</th><th>请求</th></tr></thead>
+        <tbody id="spend-rows"><tr><td colspan="5" class="dim">加载中…</td></tr></tbody>
+      </table></div>
+      <div class="hint" id="spend-hint"></div>
+    </div>
+  </div>
+
   <footer id="foot">加载中…</footer>
 </div>
 <script>
@@ -154,19 +201,90 @@ function esc(s) {
     ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 }
 
+const money = v => "$" + (v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toFixed(5));
+const big = n => {
+  if (n === null || n === undefined) return "–";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+};
+
+function renderSpend(d) {
+  const t = d.totals || {};
+  document.getElementById("p-spend").textContent = money(t.spend || 0);
+  document.getElementById("p-month").textContent = (d.month || "") + " 花费";
+  document.getElementById("p-tokens").textContent = big(t.total_tokens || 0);
+  document.getElementById("p-reqs").textContent = big(t.requests || 0);
+
+  const rows = d.keys || [];
+  document.getElementById("spend-rows").innerHTML = rows.length
+    ? rows.map((k, i) =>
+        "<tr><td class='who'><span class='rank'>" + (i + 1) + "</span>" + esc(k.alias) + "</td>"
+        + "<td class='num'>" + money(k.spend) + "</td>"
+        + "<td class='num'>" + big(k.total_tokens) + "</td>"
+        + "<td class='num dim'>" + big(k.cache_read_tokens) + "</td>"
+        + "<td class='num'>" + big(k.requests)
+        + (k.failed ? " <span style='color:var(--bad)'>(" + k.failed + " 失败)</span>" : "")
+        + "</td></tr>").join("")
+    : "<tr><td colspan='5' class='dim'>本月还没有这个通道的调用记录。</td></tr>";
+
+  const note = d.error
+    ? "<span style='color:var(--bad)'>" + esc(d.error) + "</span><br>"
+    : "";
+  document.getElementById("spend-hint").innerHTML = note
+    + "统计口径：litellm 记录的 " + esc((d.models || []).join(" / "))
+    + "，" + esc(d.start || "") + " ~ " + esc(d.end || "") + "（UTC）。"
+    + "金额是 litellm 按配置单价的记账（quick = 官方 Opus 的 1/10），"
+    + "不是 AWS 账单——Quick 席位是包月配额制。"
+    + (d.cache_age_seconds ? "缓存 " + Math.round(d.cache_age_seconds) + " 秒前。" : "");
+}
+
+let active = "pool", spendLoaded = false;
+
+function show(which) {
+  active = which;
+  document.getElementById("pane-pool").hidden = which !== "pool";
+  document.getElementById("pane-spend").hidden = which !== "spend";
+  document.getElementById("tab-pool").setAttribute("aria-selected", which === "pool");
+  document.getElementById("tab-spend").setAttribute("aria-selected", which === "spend");
+  document.getElementById("sub").textContent = which === "pool"
+    ? "各账号剩余额度 · 每 20 秒自动刷新"
+    : "本通道各虚拟 key 的当月消耗排名 · 每 5 分钟刷新一次";
+  if (which === "spend" && !spendLoaded) { spendLoaded = true; tickSpend(); }
+}
+
+function apiBase() {
+  let base = location.pathname;                   // works under any status path
+  while (base.endsWith("/")) base = base.slice(0, -1);
+  return base;
+}
+
 async function tick() {
   try {
-    let base = location.pathname;                 // works under any status path
-    while (base.endsWith("/")) base = base.slice(0, -1);
-    const r = await fetch(base + "/api/pool" + location.search, {cache: "no-store"});
+    const r = await fetch(apiBase() + "/api/pool" + location.search, {cache: "no-store"});
     if (!r.ok) throw new Error(r.status);
     render(await r.json());
   } catch (e) {
     document.getElementById("foot").textContent = "刷新失败（" + e.message + "），重试中…";
   }
 }
+
+async function tickSpend() {
+  try {
+    const r = await fetch(apiBase() + "/api/litellm" + location.search, {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    renderSpend(await r.json());
+  } catch (e) {
+    document.getElementById("spend-hint").textContent = "读取花费失败（" + e.message + "）。";
+  }
+}
+
 tick();
 setInterval(tick, 20000);
+// The spend query walks a month of rows server-side; it is cached there, and the tab
+// only refreshes while it is the one being looked at.
+setInterval(() => { if (active === "spend") tickSpend(); }, 300000);
 </script>
 </body>
 </html>
@@ -209,12 +327,23 @@ def create_status_app(path: Optional[str] = None) -> FastAPI:
         pool.discover()
         return JSONResponse(pool.snapshot(), headers={"Cache-Control": "no-store"})
 
+    async def _api_litellm(request: Request) -> Any:
+        """This channel's per-key spend for the month, as litellm accounts for it.
+
+        Key *aliases* only — the report never carries a key, and the query never
+        leaves the docker network.
+        """
+        if not _authorized(request):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(await monthly_spend(), headers={"Cache-Control": "no-store"})
+
     # Both with and without the trailing slash; the page's fetch() derives the API
     # URL from its own pathname, so either entry point works.
     app.add_api_route(prefix or "/", _index, methods=["GET"], response_class=HTMLResponse)
     if prefix:
         app.add_api_route(f"{prefix}/", _index, methods=["GET"], response_class=HTMLResponse)
     app.add_api_route(f"{prefix}/api/pool", _api_pool, methods=["GET"])
+    app.add_api_route(f"{prefix}/api/litellm", _api_litellm, methods=["GET"])
 
     @app.exception_handler(404)
     async def _not_found(request: Request, exc: Any) -> Any:
