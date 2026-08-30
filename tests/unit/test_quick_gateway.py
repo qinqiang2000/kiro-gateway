@@ -2031,6 +2031,86 @@ class TestQuotaBenchIsRetracted:
         assert account.failures == 4
 
 
+class TestCredentialReplacementRevives:
+    """Uploading a new creds file is the operator saying "try again"."""
+
+    def _touch(self, path, offset=10.0):
+        """Write new content and push the mtime forward (coarse-clock safe)."""
+        import os
+
+        path.write_text(json.dumps(_sample_blob()), encoding="utf-8")
+        stamp = path.stat().st_mtime + offset
+        os.utime(path, (stamp, stamp))
+
+    def test_a_replaced_file_re_enables_a_disabled_account(self, pool_env):
+        account = pool_env.get("default")
+        account.auth._stamp_mtime()                    # as if it had been loaded
+        pool_env.note_failure(account, 400, "Keycloak refresh failed (400): invalid_grant")
+        assert account.disabled_reason
+
+        self._touch(account.creds_file)
+        pool_env.discover()
+
+        assert account.disabled_reason == ""
+        assert account.cooling() is False
+        assert account.failures == 0
+
+    def test_a_replaced_file_also_ends_a_cooldown(self, pool_env):
+        account = pool_env.get("b")
+        account.auth._stamp_mtime()
+        pool_env.note_failure(account, 429, "Too many requests")
+        assert account.cooling() is True
+
+        self._touch(account.creds_file)
+        pool_env.discover()
+
+        assert account.cooling() is False
+
+    def test_our_own_token_rotation_does_not_revive(self, pool_env):
+        """The gateway rewrites every file on every refresh — mtime alone means nothing."""
+        account = pool_env.get("b")
+        account.auth._stamp_mtime()
+        pool_env.note_failure(account, 429, "Too many requests")
+
+        self._touch(account.creds_file)
+        account.auth._stamp_mtime()                    # the write was ours
+        pool_env.discover()
+
+        assert account.cooling() is True
+
+    def test_an_unloaded_account_is_not_treated_as_replaced(self, pool_env):
+        account = pool_env.get("b")
+        assert account.auth._own_mtime == 0.0
+        pool_env.note_failure(account, 429, "Too many requests")
+
+        pool_env.discover()
+
+        assert account.cooling() is True
+
+    def test_the_replacement_is_noticed_once_not_every_pass(self, pool_env):
+        account = pool_env.get("default")
+        account.auth._stamp_mtime()
+        self._touch(account.creds_file)
+        pool_env.discover()
+
+        pool_env.note_failure(account, 429, "Too many requests")
+        pool_env.discover()
+
+        # The same (already handled) file must not keep clearing new cooldowns.
+        assert account.cooling() is True
+
+    @pytest.mark.asyncio
+    async def test_marking_stale_reloads_the_credential_from_disk(self, pool_env):
+        account = pool_env.get("default")
+        creds = await account.auth.get_credentials()
+        creds.user_arn = "stale-in-memory"
+
+        account.auth.mark_stale()
+        fresh = await account.auth.get_credentials()
+
+        assert fresh.user_arn != "stale-in-memory"
+
+
 class TestQuotaCooldownCap:
     """A monthly deadline weeks away becomes a repeating half-open trial."""
 

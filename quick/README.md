@@ -133,7 +133,7 @@ belongs to the client and the error is surfaced as-is.
 | session allowance at 0 % | cooldown until the window resets |
 | 429 / IAM deny / backend error | cooldown 5 min / 5 min / 1 min, **doubling per consecutive failure** up to `QUICK_POOL_MAX_COOLDOWN_SECONDS` (1 h) |
 | a **real failure** while the monthly bucket is spent | re-classified as a quota block → cooldown until `resetsAt` |
-| Keycloak `invalid_grant` on refresh | **disabled** + one alert — only a re-uploaded creds file fixes it |
+| Keycloak `invalid_grant` on refresh | **disabled** + one alert — waiting never fixes it, only a re-uploaded creds file (which the pool then picks up by itself, below) |
 
 Every quota bench is capped at `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` (default 6 h), and
 a reading that reports real headroom **retracts** one:
@@ -171,6 +171,17 @@ working account on the guess that Quick *would* block it costs capacity for noth
   why a quota deadline is **capped** rather than obeyed literally: a `resetsAt` three
   weeks out would mean three weeks with no trial and no probe, i.e. no way at all to
   notice the block had lifted.
+
+* **the one thing a reading cannot fix** — a refresh token Keycloak rejects outright
+  (`invalid_grant`) never recovers on its own, so that account is *disabled* rather
+  than cooled, and only a new credential file helps. `discover()` therefore watches
+  for exactly that: when an account's file no longer matches what its own manager
+  last wrote, the upload is treated as the operator saying "try again" — the disable,
+  the cooldown and the failure streak are cleared and the dead in-memory token is
+  dropped. The trigger is **whose write was last**, never mtime alone: the gateway
+  rewrites every file on every token rotation, so mtime alone would revive a cooling
+  account several times an hour. Discovery runs on the hourly `usage_watch` cycle and
+  on every status-page poll, so an `scp` heals the pool without a restart.
 
 > **A bench is a claim, and a reading can refute it** (learned live 2026-08-30). The
 > tenant admin raised the limit profile from 480 to 1080 units/user; `default`, benched
@@ -552,7 +563,8 @@ share is back at or above the threshold (a new session window), so a long stretc
 does not re-fire. A failed push leaves the state armed and the next cycle retries.
 
 Each account gets its own edge-triggered alert, plus two pool-level ones: a
-credential that died (`invalid_grant` — only a re-upload fixes it), and **every
+credential that died (`invalid_grant` — re-upload the file and the pool re-enables it
+itself), and **every
 account unusable**, which is the only alert that means *go add an account*.
 
 ```bash

@@ -217,12 +217,54 @@ class QuickAuthManager:
         self._profile_id: Optional[str] = None
         self._creds_file: Optional[Path] = creds_file
         self.name: str = name
+        # mtime of the last file content THIS manager put there (or read). Anything
+        # else on disk is somebody replacing the credential — see
+        # :meth:`file_replaced_externally`.
+        self._own_mtime: float = 0.0
+        self._reload_requested: bool = False
 
     @property
     def creds_file(self) -> Path:
         """The credential file this manager reads and writes."""
         # Resolved lazily so monkeypatching quick.auth.QUICK_CREDS_FILE still works.
         return self._creds_file or QUICK_CREDS_FILE
+
+    def _stamp_mtime(self) -> None:
+        """Remember the file's mtime as *ours* (after we read or wrote it)."""
+        try:
+            self._own_mtime = self.creds_file.stat().st_mtime
+        except OSError:
+            self._own_mtime = 0.0
+
+    def file_replaced_externally(self) -> bool:
+        """True when the credential file on disk is not the content we last handled.
+
+        Keycloak rotates the refresh token on every refresh and we write the rotation
+        back, so mtime alone means nothing — the gateway churns it constantly. What
+        matters is whether the *newest* write was ours. When it was not, somebody
+        uploaded a fresh credential, which is the only thing that fixes an
+        ``invalid_grant`` account (:meth:`QuickPool.discover`).
+        """
+        if not self._own_mtime:
+            return False           # never loaded: nothing has been replaced yet
+        try:
+            return self.creds_file.stat().st_mtime != self._own_mtime
+        except OSError:
+            return False           # gone or unreadable: discovery handles that
+
+    def mark_stale(self) -> None:
+        """Drop the in-memory credential at the next lock acquisition.
+
+        Deliberately a flag rather than ``self._creds = None``: this is called from
+        synchronous discovery, and clearing the field outright could land between a
+        refresh and its return inside :meth:`get_credentials`.
+
+        The file we are about to read becomes *ours* right away, so the caller that
+        polls :meth:`file_replaced_externally` sees the replacement once instead of
+        on every pass until the reload actually happens.
+        """
+        self._reload_requested = True
+        self._stamp_mtime()
 
     def _load(self) -> QuickCredentials:
         """Load (or reload) credentials, file-first then Keychain.
@@ -265,6 +307,7 @@ class QuickAuthManager:
         if bootstrap_from_keychain:
             self._save_creds_file(creds)
 
+        self._stamp_mtime()
         logger.info(
             "Loaded Quick credentials (account={}, source={}, profile={}, user={}, tenant={})",
             self.name or "default",
@@ -295,6 +338,8 @@ class QuickAuthManager:
                     json.dump(creds.to_dict(), fh, ensure_ascii=False, indent=2)
                 os.chmod(tmp_path, 0o600)
                 os.replace(tmp_path, target)
+                # Claim this write, so a LATER mtime means somebody else's file.
+                self._stamp_mtime()
             except BaseException:
                 # Clean up the temp file on any failure before re-raising.
                 try:
@@ -351,11 +396,20 @@ class QuickAuthManager:
     async def get_credentials(self) -> QuickCredentials:
         """Return current credentials, (re)loading and refreshing as needed."""
         async with self._lock:
+            self._honour_reload()
             if self._creds is None:
                 self._creds = self._load()
             if self._creds.is_expired():
                 await self._refresh(self._creds)
             return self._creds
+
+    def _honour_reload(self) -> None:
+        """Act on a pending :meth:`mark_stale` — call only while holding the lock."""
+        if self._reload_requested:
+            self._reload_requested = False
+            self._creds = None
+            logger.info("Quick auth: reloading '{}' from a replaced credential file.",
+                        self.name or "default")
 
     async def invalidate(self) -> None:
         """Force a full reload + refresh on the next call (e.g. after a 401/403)."""
@@ -371,6 +425,7 @@ class QuickAuthManager:
         propagate to the caller (the background loop logs and retries).
         """
         async with self._lock:
+            self._honour_reload()
             if self._creds is None:
                 self._creds = self._load()
             await self._refresh(self._creds)

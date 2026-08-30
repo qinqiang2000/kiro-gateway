@@ -223,6 +223,9 @@ docker compose -p quick-gateway exec quick-gateway python -m quick.usage_watch -
   that `"armed": true` under `accounts.<name>` in `quickwork/session-usage-state.json`.
 - An account shows **disabled** on the status page → its refresh token is dead
   (`invalid_grant`); re-export it on the mac (§1) and `./quick/deploy.sh --creds-only <name>`.
+  No restart needed to re-enable it: the pool notices the replaced file on its next
+  discovery pass (hourly, or immediately when the status page is loaded) and puts the
+  account back in rotation by itself.
 - An account shows **cooling** → normal: its allowance hit 0 or entitlement was revoked;
   it returns by itself. A *low but usable* account stays `ready` (a low `resumeInMinutes`
   is a window-reset countdown, not a lockout).

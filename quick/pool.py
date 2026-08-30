@@ -341,6 +341,7 @@ class QuickPool:
             existing = self._accounts.get(name)
             if existing is not None:
                 existing.creds_file = path
+                self._note_replaced_credential(existing)
                 continue
             self._accounts[name] = Account(
                 name=name, creds_file=path, auth=QuickAuthManager(path, name=name)
@@ -545,6 +546,33 @@ class QuickPool:
         if QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS > 0:
             seconds = min(seconds, float(QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS))
         self.cool_down(account, seconds, reason, "quota")
+
+    def _note_replaced_credential(self, account: Account) -> None:
+        """Re-enable an account whose credential file somebody just replaced.
+
+        This is the recovery path for the one failure nothing else can undo: a
+        refresh token Keycloak rejects outright (``invalid_grant``) disables the
+        account, and no amount of waiting fixes it — only a new file does. Uploading
+        one is therefore the operator saying "try again", so it clears the disable,
+        the cooldown and the failure streak, and drops the dead in-memory token.
+
+        The trigger is the file no longer matching what this account's own manager
+        last wrote (:meth:`quick.auth.QuickAuthManager.file_replaced_externally`),
+        never mtime alone: the gateway rewrites every file on every token rotation,
+        so mtime alone would revive a cooling account several times an hour.
+
+        Args:
+            account: The account whose credential file to check.
+        """
+        if not account.auth.file_replaced_externally():
+            return
+        was = account.disabled_reason or account.cooldown_reason
+        account.auth.mark_stale()
+        self.revive(account)
+        logger.info(
+            "Quick pool: account '{}' credential file replaced — back in rotation{}.",
+            account.name, f" (was: {was})" if was else "",
+        )
 
     def revive(self, account: Account) -> None:
         """Clear a disable/cooldown (used after a credential file is replaced)."""
