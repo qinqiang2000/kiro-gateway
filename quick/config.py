@@ -98,6 +98,17 @@ QUICK_POOL_MAX_COOLDOWN_SECONDS: int = int(
     os.getenv("QUICK_POOL_MAX_COOLDOWN_SECONDS", "3600")
 )
 
+# Ceiling for a QUOTA bench, whose deadline comes from the backend's own resetsAt and
+# can therefore be weeks away. Sleeping that long is a bet that nothing changes in the
+# meantime — but an admin raising the limit profile is exactly what does change (seen
+# live: 480 -> 1080 units/user), and a benched account is never probed, so the pool
+# would never find out. Capping it turns the deadline into a periodic half-open trial:
+# one real request tests the account, and either it works (observe_usage clears the
+# rest of the bench) or it re-cools. 0 = no cap, honour resetsAt exactly.
+QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS: int = int(
+    os.getenv("QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS", "21600")
+)
+
 # How many accounts one request may try before giving up (1 = no failover).
 QUICK_POOL_MAX_ATTEMPTS: int = int(os.getenv("QUICK_POOL_MAX_ATTEMPTS", "2"))
 

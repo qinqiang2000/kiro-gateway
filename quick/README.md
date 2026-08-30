@@ -135,6 +135,16 @@ belongs to the client and the error is surfaced as-is.
 | a **real failure** while the monthly bucket is spent | re-classified as a quota block → cooldown until `resetsAt` |
 | Keycloak `invalid_grant` on refresh | **disabled** + one alert — only a re-uploaded creds file fixes it |
 
+Every quota bench is capped at `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` (default 6 h), and
+a reading that reports real headroom **retracts** one:
+
+| condition | effect |
+|-----------|--------|
+| a quota deadline (`resetsAt`) further out than the cap | shortened to the cap, so the wait is a repeating half-open trial |
+| reading says ALLOWED **and** the buckets it names have room | the quota bench is lifted immediately (the failure streak is not) |
+| the same reading, but the monthly bucket is still empty (overage on) | left benched — that reading agrees with the bench |
+| a bench from a 429 / IAM deny / 5xx | left benched — quota headroom is no evidence about those |
+
 > `resumeInMinutes` is **not** a lockout timer — it counts down to the rolling
 > session window's reset and is populated while the account is perfectly usable
 > (verified live: 21 % left, `resumeInMinutes` 55, `entitlementStatus` ALLOWED). It
@@ -157,7 +167,21 @@ working account on the guess that Quick *would* block it costs capacity for noth
 * **coming back** — the cooldown is an absolute deadline and the first request after
   it expires *is* the half-open trial: it either succeeds (streak cleared) or re-cools
   with the next backoff step. The hourly `usage_watch` cycle skips its probe for a
-  benched account precisely so it does not spend a failing request per hour.
+  benched account precisely so it does not spend a failing request per hour. This is
+  why a quota deadline is **capped** rather than obeyed literally: a `resetsAt` three
+  weeks out would mean three weeks with no trial and no probe, i.e. no way at all to
+  notice the block had lifted.
+
+> **A bench is a claim, and a reading can refute it** (learned live 2026-08-30). The
+> tenant admin raised the limit profile from 480 to 1080 units/user; `default`, benched
+> the day before until `resetsAt`, was in fact `ALLOWED` with 360 units — and stayed out
+> of rotation, because `observe_usage` only ever benched and never released (`revive()`
+> existed with no caller), while `usage_watch` skips benched accounts by design. The
+> account slept on 6 usable agent-hours that units-don't-roll-over would have destroyed
+> at the monthly reset. Symmetry is the fix: whatever a reading may bench an account
+> for, that same reading may un-bench it for — and only for that. A healthy
+> `usageSummary` refutes "no quota"; it says nothing about a 429 or an IAM deny, so
+> those benches stand.
 
 > **Trust the reading over the error text — but only after something failed.** When an
 > account's monthly bucket is spent, *any* failure is that block however the backend
@@ -227,6 +251,7 @@ python -m quick.usage_watch --account b --json    # one account
 | `QUICK_ACCOUNTS` | explicit account list (`default,b`), overriding discovery |
 | `QUICK_POOL_MAX_ATTEMPTS` | accounts one request may try (default 2; 1 = no failover) |
 | `QUICK_POOL_COOLDOWN_SECONDS` | default cooldown when the backend gives no resume hint (900) |
+| `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` | cap on a quota bench, so a far-off `resetsAt` still gets a half-open trial (21600 = 6 h; `0` = obey `resetsAt` exactly) |
 | `QUICK_POOL_QUOTA_BUCKET` | ranking bucket width in percent (10) |
 | `QUICK_POOL_AVOID_OVERAGE` | `1` to prefer accounts with monthly headroom over overage |
 

@@ -48,6 +48,7 @@ from quick.config import (
     QUICK_POOL_AVOID_OVERAGE,
     QUICK_POOL_COOLDOWN_SECONDS,
     QUICK_POOL_MAX_COOLDOWN_SECONDS,
+    QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS,
     QUICK_POOL_OVERAGE_POLICY,
     QUICK_POOL_QUOTA_BUCKET,
 )
@@ -164,6 +165,9 @@ class Account:
         failures: Consecutive failures since the last success.
         cooldown_until: Epoch seconds until which the account is out of rotation.
         cooldown_reason: Why it is cooling down (shown on the status page).
+        cooldown_kind: Failure kind that started the current cooldown, so a later
+            reading can retract a *quota* bench it contradicts without touching a
+            bench a healthy usageSummary says nothing about (429, IAM deny, 5xx).
         disabled_reason: Non-empty when the credential is permanently unusable.
         last_error: Most recent error text (truncated).
         last_used: Epoch seconds of the last request served.
@@ -177,6 +181,7 @@ class Account:
     failures: int = 0
     cooldown_until: float = 0.0
     cooldown_reason: str = ""
+    cooldown_kind: str = ""
     disabled_reason: str = ""
     last_error: str = ""
     last_used: float = 0.0
@@ -259,6 +264,32 @@ def _bucket(value: Optional[float], width: int) -> int:
     if value is None:
         return 100 // max(1, width)
     return int(max(0.0, value) // max(1, width))
+
+
+def _reading_is_healthy(snapshot: UsageSnapshot) -> bool:
+    """True when a reading says the account has quota to serve with, right now.
+
+    Deliberately stricter than "Quick would answer": an account whose monthly bucket is
+    spent reads ALLOWED while overage is on, and that is *not* grounds to retract a
+    bench — the reading agrees with it. Only headroom the backend positively reports
+    counts; anything it leaves unsaid is read as healthy, which matches the rest of the
+    pool (an unmeasured account is treated as full).
+
+    Args:
+        snapshot: The freshest entitlement reading.
+
+    Returns:
+        Whether every bucket the reading mentions still has room.
+    """
+    if snapshot.entitlement_status and snapshot.entitlement_status != "ALLOWED":
+        return False
+    if snapshot.session_remaining_pct is not None and snapshot.session_remaining_pct <= 0:
+        return False
+    if snapshot.monthly_available_units is not None:
+        return snapshot.monthly_available_units > 0
+    if snapshot.monthly_used_pct is not None:
+        return snapshot.monthly_used_pct < 100
+    return True
 
 
 class QuickPool:
@@ -449,7 +480,7 @@ class QuickPool:
             cooldown_seconds if cooldown_seconds is not None
             else self._backoff(kind, account.failures)
         )
-        self.cool_down(account, seconds, kind)
+        self.cool_down(account, seconds, kind, kind)
         return kind
 
     @staticmethod
@@ -469,13 +500,24 @@ class QuickPool:
         base = _COOLDOWN_BY_KIND.get(kind, 60)
         return float(min(base * 2 ** max(0, failures - 1), QUICK_POOL_MAX_COOLDOWN_SECONDS))
 
-    def cool_down(self, account: Account, seconds: float, reason: str) -> None:
-        """Put an account out of rotation for ``seconds`` (never shortens a longer rest)."""
+    def cool_down(
+        self, account: Account, seconds: float, reason: str, kind: str = ""
+    ) -> None:
+        """Put an account out of rotation for ``seconds`` (never shortens a longer rest).
+
+        Args:
+            account: The account to bench.
+            seconds: How long to stay out of rotation.
+            reason: Shown on the status page.
+            kind: Failure kind behind it (see :func:`classify_failure`), remembered so
+                :meth:`observe_usage` knows whether a healthy reading contradicts it.
+        """
         until = time.time() + max(0.0, seconds)
         if until <= account.cooldown_until:
             return
         account.cooldown_until = until
         account.cooldown_reason = reason
+        account.cooldown_kind = kind or reason
         logger.warning(
             "Quick pool: account '{}' cooling down {}s ({}).",
             account.name, int(seconds), reason,
@@ -484,22 +526,51 @@ class QuickPool:
     def cool_down_until(self, account: Account, epoch: Optional[int], reason: str) -> None:
         """Bench an account until an absolute deadline (e.g. the monthly reset).
 
+        The deadline is capped by :data:`QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS`: a
+        monthly ``resetsAt`` can be three weeks out, and sleeping that long assumes the
+        entitlement cannot change before then — which is wrong, because an admin can
+        raise the limit profile at any moment and a benched account is deliberately
+        never probed. The cap makes the wait a repeating half-open trial instead: the
+        first request after it either succeeds, or fails over and re-cools.
+
         Args:
             account: The account to bench.
             epoch: Unix timestamp to sleep until; falsy falls back to the quota default.
             reason: Shown on the status page.
         """
         if not epoch:
-            self.cool_down(account, _COOLDOWN_BY_KIND["quota"], reason)
+            self.cool_down(account, _COOLDOWN_BY_KIND["quota"], reason, "quota")
             return
-        self.cool_down(account, max(0.0, epoch - time.time()), reason)
+        seconds = max(0.0, epoch - time.time())
+        if QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS > 0:
+            seconds = min(seconds, float(QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS))
+        self.cool_down(account, seconds, reason, "quota")
 
     def revive(self, account: Account) -> None:
         """Clear a disable/cooldown (used after a credential file is replaced)."""
         account.disabled_reason = ""
         account.cooldown_until = 0.0
         account.cooldown_reason = ""
+        account.cooldown_kind = ""
         account.failures = 0
+
+    def release(self, account: Account, reason: str) -> None:
+        """Put a cooling account back in rotation (the cooldown's premise no longer holds).
+
+        Only the cooldown is lifted — the failure streak is left alone, so if the
+        account fails again the back-off resumes where it was instead of restarting
+        at the shortest step.
+
+        Args:
+            account: The account to return to rotation.
+            reason: Why the bench was retracted (logged).
+        """
+        if not account.cooling():
+            return
+        account.cooldown_until = 0.0
+        account.cooldown_reason = ""
+        account.cooldown_kind = ""
+        logger.info("Quick pool: account '{}' back in rotation ({}).", account.name, reason)
 
     def observe_usage(self, name: str, snapshot: UsageSnapshot) -> None:
         """React to a fresh entitlement reading for ``name``.
@@ -507,6 +578,11 @@ class QuickPool:
         Only a *hard* block benches an account: entitlement revoked, or the session
         allowance actually down to zero. A merely low allowance needs no special
         case — :meth:`select` already ranks it below its healthier siblings.
+
+        It works in **both** directions: a reading that reports real headroom retracts a
+        quota bench, because that bench's whole premise was "this account has no quota"
+        and the backend just said otherwise. It retracts nothing else — a healthy
+        usageSummary is no evidence about a 429, an IAM deny or a 5xx.
 
         ``resumeInMinutes`` is **not** a lockout timer: it is how long until the
         rolling session window resets, and it is populated while the account is still
@@ -516,6 +592,14 @@ class QuickPool:
         """
         account = self._accounts.get(name)
         if account is None:
+            return
+        if _reading_is_healthy(snapshot):
+            # The bench said "no quota"; the backend now says there is. Retract it —
+            # otherwise a raised limit profile (480 -> 1080 units/user, seen live) can
+            # only be discovered when the cooldown finally lapses, and the headroom in
+            # between expires unused at the monthly reset.
+            if account.cooldown_kind == "quota":
+                self.release(account, "entitlement reading is healthy again")
             return
         if snapshot.entitlement_status and snapshot.entitlement_status != "ALLOWED":
             reason = f"entitlement {snapshot.entitlement_status}"

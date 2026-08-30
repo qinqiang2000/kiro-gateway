@@ -1113,15 +1113,21 @@ class TestPoolFailureHandling:
         assert pool_env.get("b").status() == "cooling"
         assert pool_env.select().name == "default"
 
-    def test_a_monthly_block_waits_for_the_entitlement_reset(self, pool_env):
-        """A flat cooldown would free the account every 15 min to be refused again."""
+    def test_a_monthly_block_waits_hours_not_the_flat_cooldown(self, pool_env):
+        """A flat cooldown would free the account every 15 min to be refused again.
+
+        The wait is sized by the reading's own ``resetsAt``, then capped so the block
+        becomes a repeating half-open trial rather than a multi-week sleep.
+        """
         import time as _time
 
         _reading("b", 0, status="BLOCKED_MONTHLY", overage=False, units=0, provisioned=480)
         account = pool_env.get("b")
+        waiting = account.cooldown_until - _time.time()
 
         assert account.status() == "cooling"
-        assert account.cooldown_until - _time.time() > 24 * 3600
+        assert waiting > 4 * 3600
+        assert waiting <= 21600
 
     def test_a_block_without_a_reset_falls_back_to_the_default_cooldown(self, pool_env):
         import time as _time
@@ -1738,6 +1744,106 @@ class TestOnlyRealFailureEvicts:
 
         assert account.cooling() is True
         assert 1500 < account.cooldown_until - time.time() <= 1800
+
+
+class TestQuotaBenchIsRetracted:
+    """A bench premised on "no quota" ends when the backend reports quota again."""
+
+    def _bench_on_quota(self, pool_env, name="default"):
+        """Bench an account the way a monthly block does, and return it."""
+        import quick.usage_watch as uw
+
+        _reading(name, 10, status="BLOCKED_MONTHLY", monthly_used=100, units=0,
+                 overage=False, resets_at=int(time.time()) + 7200)
+        pool_env.observe_usage(name, uw.snapshot_for(name))
+        account = pool_env.get(name)
+        assert account.cooling() is True
+        return account
+
+    def test_a_healthy_reading_puts_the_account_back_in_rotation(self, pool_env):
+        import quick.usage_watch as uw
+
+        account = self._bench_on_quota(pool_env)
+
+        # What an admin raising the limit profile looks like: same account, same month,
+        # units that were 0/480 are now 360/1080.
+        _reading("default", 0, monthly_used=66, units=360, provisioned=1080, overage=False)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        assert account.cooling() is False
+        assert account.status() == "ready"
+
+    def test_a_throttle_bench_is_left_alone(self, pool_env):
+        import quick.usage_watch as uw
+
+        account = pool_env.get("b")
+        pool_env.note_failure(account, 429, "Too many requests")
+
+        _reading("b", 0, monthly_used=20, units=576, provisioned=720)
+        pool_env.observe_usage("b", uw.snapshot_for("b"))
+
+        # Quota was never the problem, so quota headroom is no evidence about it.
+        assert account.cooling() is True
+
+    def test_a_spent_account_on_overage_stays_benched(self, pool_env):
+        import quick.usage_watch as uw
+
+        account = self._bench_on_quota(pool_env)
+
+        # ALLOWED (overage pays for it) but the monthly bucket is still empty — the
+        # reading agrees with the bench rather than contradicting it.
+        _reading("default", 0, monthly_used=100, units=0, overage=True)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        assert account.cooling() is True
+
+    def test_the_failure_streak_survives_the_release(self, pool_env):
+        import quick.usage_watch as uw
+
+        account = self._bench_on_quota(pool_env)
+        account.failures = 4
+
+        _reading("default", 0, monthly_used=66, units=360, provisioned=1080, overage=False)
+        pool_env.observe_usage("default", uw.snapshot_for("default"))
+
+        # Back in rotation, but still on its back-off step: a release is not a success.
+        assert account.cooling() is False
+        assert account.failures == 4
+
+
+class TestQuotaCooldownCap:
+    """A monthly deadline weeks away becomes a repeating half-open trial."""
+
+    def test_a_far_monthly_reset_is_capped(self, pool_env):
+        resets = int(time.time()) + 30 * 86400
+        _reading("default", 10, monthly_used=100, units=0, overage=False, resets_at=resets)
+        account = pool_env.get("default")
+
+        pool_env.note_failure(account, 429, "entitlement BLOCKED_MONTHLY")
+
+        assert account.cooldown_until - time.time() <= 21600
+        assert account.cooldown_kind == "quota"
+
+    def test_a_near_reset_is_still_honoured_exactly(self, pool_env):
+        resets = int(time.time()) + 1800
+        _reading("default", 10, monthly_used=100, units=0, overage=False, resets_at=resets)
+        account = pool_env.get("default")
+
+        pool_env.note_failure(account, 429, "entitlement BLOCKED_MONTHLY")
+
+        assert 1700 < account.cooldown_until - time.time() <= 1800
+
+    def test_the_cap_can_be_disabled(self, pool_env, monkeypatch):
+        import quick.pool as qp
+
+        monkeypatch.setattr(qp, "QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS", 0)
+        resets = int(time.time()) + 30 * 86400
+        _reading("default", 10, monthly_used=100, units=0, overage=False, resets_at=resets)
+        account = pool_env.get("default")
+
+        pool_env.note_failure(account, 429, "entitlement BLOCKED_MONTHLY")
+
+        assert account.cooldown_until - time.time() > 21600
 
 
 class TestFailureCrossReference:
