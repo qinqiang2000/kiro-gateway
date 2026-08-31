@@ -88,10 +88,12 @@ pool member; the account name comes from the filename:
 | `gateway-creds.json` | `default` |
 | `gateway-creds-b.json` | `b` |
 
-**Adding an account is: drop one more file in and restart.** No extra container, no
-load-balancer config. (Contrast the Kiro pool next door: one container per account
-behind an nginx `least_conn` upstream, where a dead account is discovered by a 502
-and fixed by hand-commenting a line.)
+**Adding an account is: drop one more file in.** No extra container, no
+load-balancer config, and no restart either — `discover()` re-scans the directory on
+every pass (the hourly `usage_watch` cycle, and every status-page poll), so a new
+file joins the pool by itself and a removed one leaves it. (Contrast the Kiro pool
+next door: one container per account behind an nginx `least_conn` upstream, where a
+dead account is discovered by a 502 and fixed by hand-commenting a line.)
 
 ### How an account is chosen
 

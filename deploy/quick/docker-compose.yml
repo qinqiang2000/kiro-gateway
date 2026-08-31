@@ -33,7 +33,7 @@ services:
       # One file per account, and the FILENAME IS THE ACCOUNT NAME:
       # gateway-creds-<name>.json -> account "<name>" (a bare gateway-creds.json
       # would be "default"). Every match becomes a pool member, so adding an
-      # account is "copy one more file in and restart". Accounts here are named
+      # account is "copy one more file in" (discovery re-scans, no restart). Named
       # after the person who owns the Quick seat, which is why the status page
       # must stay token-gated (QUICK_STATUS_TOKEN below).
       # This one is only the fallback single-account manager (CLI probes, keep-alive
