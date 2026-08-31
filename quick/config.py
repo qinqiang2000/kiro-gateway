@@ -146,9 +146,13 @@ LITELLM_MASTER_KEY: str = os.getenv("LITELLM_MASTER_KEY", "")
 
 # Which litellm model names count as "this channel". litellm records the *resolved*
 # model (`anthropic/claude-opus-quick`) on a successful call and the requested name
-# (`claude-opus-quick`) on a failed one, so both are queried and merged.
+# (`claude-opus-quick`) on a failed one, so both are queried and merged. Every channel
+# published on this gateway belongs here — they all spend the same pool quota, so a
+# ranking that listed only one of them would under-report whoever used the other.
 LITELLM_QUICK_MODELS: str = os.getenv(
-    "LITELLM_QUICK_MODELS", "anthropic/claude-opus-quick,claude-opus-quick"
+    "LITELLM_QUICK_MODELS",
+    "anthropic/claude-opus-quick,claude-opus-quick,"
+    "anthropic/claude-sonnet-quick,claude-sonnet-quick",
 )
 
 # The spend query walks a month of daily rows, so it is cached rather than run per
@@ -207,6 +211,9 @@ QUICK_MODELS: Dict[str, str] = {
     "global.anthropic.claude-opus-4-8": "global.anthropic.claude-opus-4-8",
     "us.anthropic.claude-opus-4-6-v1": "us.anthropic.claude-opus-4-6-v1",
     "us.anthropic.claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
+    # Verified live 2026-08-31 (``model_watch --probe``): a real completion, unlike
+    # opus-5. It is also what the registry now serves as ``balanced`` at 99 % rollout.
+    "us.anthropic.claude-sonnet-5": "us.anthropic.claude-sonnet-5",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "global.anthropic.claude-haiku-4-5-20251001-v1:0": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
@@ -216,6 +223,7 @@ QUICK_MODEL_ALIASES: Dict[str, str] = {
     "claude-opus-4-8": "us.anthropic.claude-opus-4-8",
     "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
     "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
+    "claude-sonnet-5": "us.anthropic.claude-sonnet-5",
     "claude-haiku-4-5": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     # Quick UI "modes" (mode=smart/balanced/fast in the app logs).
     "smart": "us.anthropic.claude-opus-4-6-v1",       # Smart -> Opus
@@ -228,20 +236,64 @@ QUICK_MODEL_ALIASES: Dict[str, str] = {
 # Override the Opus target with QUICK_OPUS_MODEL if you prefer opus-4-6-v1.
 QUICK_MODEL_FAMILY: Dict[str, str] = {
     "opus": os.getenv("QUICK_OPUS_MODEL", "us.anthropic.claude-opus-4-8"),
-    "sonnet": os.getenv("QUICK_SONNET_MODEL", "us.anthropic.claude-sonnet-4-6"),
+    "sonnet": os.getenv("QUICK_SONNET_MODEL", "us.anthropic.claude-sonnet-5"),
     "haiku": os.getenv("QUICK_HAIKU_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
 }
 
-# Default model when the client name cannot be resolved.
-DEFAULT_QUICK_MODEL: str = os.getenv(
-    "QUICK_DEFAULT_MODEL", "us.anthropic.claude-sonnet-4-6"
-)
+# Default model when the client name cannot be resolved: the best usable Sonnet.
+DEFAULT_QUICK_MODEL: str = os.getenv("QUICK_DEFAULT_MODEL", QUICK_MODEL_FAMILY["sonnet"])
 
 # Force EVERY request to this Quick model, ignoring whatever the client picked.
 # Set to the empty string (``QUICK_FORCE_MODEL=`` in .env) to disable and fall
 # back to per-request family mapping. Change the default here to switch the
 # forced model (e.g. to us.anthropic.claude-opus-5 if/when it becomes available).
+# Channel names (below) are the one thing it does NOT override.
 QUICK_FORCE_MODEL: str = os.getenv("QUICK_FORCE_MODEL", "us.anthropic.claude-opus-4-8")
+
+# ==================================================================================================
+# Channel names: the model names this gateway is *published* under (litellm model_name)
+# ==================================================================================================
+
+# A client sending "claude-opus-5" picked that name off its own menu and knows nothing
+# about Quick — QUICK_FORCE_MODEL exists precisely to overrule it. A name ending in
+# ``-quick`` is the opposite: only this gateway serves those names, so one is a routing
+# instruction from whoever configured the channel, and it wins over the force. That is
+# what lets a single gateway publish `claude-opus-quick` and `claude-sonnet-quick` side
+# by side while everything else stays forced onto one model.
+QUICK_CHANNEL_SUFFIX: str = "-quick"
+
+
+def _family_of(model_id: Optional[str]) -> Optional[str]:
+    """The Claude family a model id or name belongs to, or ``None``."""
+    low = (model_id or "").lower()
+    for family in QUICK_MODEL_FAMILY:
+        if family in low:
+            return family
+    return None
+
+
+def channel_model(name: Optional[str]) -> Optional[str]:
+    """Resolve a ``…-quick`` channel name to its Quick model id.
+
+    Args:
+        name: The ``model`` field from the client request.
+
+    Returns:
+        The channel's target id, or ``None`` when ``name`` is not a channel name
+        (i.e. does not end in :data:`QUICK_CHANNEL_SUFFIX` and name a family).
+    """
+    low = (name or "").strip().lower()
+    if not low.endswith(QUICK_CHANNEL_SUFFIX):
+        return None
+    family = _family_of(low)
+    if family is None:
+        return None
+    # Within its own family the forced model is the operator's pick, so that family's
+    # channel follows it: point QUICK_FORCE_MODEL at opus-5 and `claude-opus-quick`
+    # moves with it instead of silently staying on 4.8. Other families are unaffected.
+    if QUICK_FORCE_MODEL and _family_of(QUICK_FORCE_MODEL) == family:
+        return QUICK_FORCE_MODEL
+    return QUICK_MODEL_FAMILY[family]
 
 
 def resolve_model(name: Optional[str]) -> str:
@@ -251,11 +303,15 @@ def resolve_model(name: Optional[str]) -> str:
         name: The ``model`` field from the client request (may be ``None``).
 
     Returns:
-        A Quick Bedrock inference-profile id. When :data:`QUICK_FORCE_MODEL` is
-        set, always returns it (ignoring ``name``). Otherwise resolves by exact
-        id/alias, then by family, falling back to :data:`DEFAULT_QUICK_MODEL` —
+        A Quick Bedrock inference-profile id. A ``…-quick`` channel name resolves to
+        that channel's family target first. Otherwise, when :data:`QUICK_FORCE_MODEL`
+        is set it always wins (ignoring ``name``); with it empty, the name resolves by
+        exact id/alias, then by family, falling back to :data:`DEFAULT_QUICK_MODEL` —
         matching this repo's "let the backend be the final arbiter" philosophy.
     """
+    channel = channel_model(name)
+    if channel:
+        return channel
     if QUICK_FORCE_MODEL:
         return QUICK_FORCE_MODEL
     if not name:

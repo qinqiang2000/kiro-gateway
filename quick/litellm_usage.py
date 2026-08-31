@@ -23,8 +23,10 @@ Two subtleties, both found by reading real rows:
   the same field off an unfiltered query would hand back each key's whole spend
   across every model in the proxy.
 
-The dollar figures are litellm's own accounting at the rates in its config (Quick is
-priced at 1/10 of official Opus list), **not** an AWS invoice: the Quick seats are
+The dollar figures are litellm's own accounting at the rates in its config (each Quick
+channel is priced at 1/10 of its own model's official list), **not** an AWS invoice: a
+Quick unit is charged by tokens and not by model, so the ranking orders people by what
+this channel *would* have cost, not by the units they burned. The Quick seats are
 flat-rate with a unit quota, so this is what the channel *would* have cost, which is
 the number worth ranking people by.
 """

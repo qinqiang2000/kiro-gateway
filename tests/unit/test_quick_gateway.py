@@ -72,6 +72,39 @@ class TestForceModel:
         assert resolve_model("claude-sonnet-4-6") == "us.anthropic.claude-opus-4-8"
 
 
+class TestChannelNames:
+    """The `-quick` names litellm publishes route by family, despite the force."""
+
+    def test_channel_names_beat_the_force(self):
+        # The default deployment forces Opus; the sonnet channel must still be Sonnet.
+        assert resolve_model("claude-sonnet-quick") == "us.anthropic.claude-sonnet-5"
+        assert resolve_model("claude-opus-quick") == "us.anthropic.claude-opus-4-8"
+        assert resolve_model("claude-haiku-quick").startswith("us.anthropic.claude-haiku-4-5")
+
+    def test_opus_channel_follows_the_forced_model_in_its_own_family(self, monkeypatch):
+        # Switching the forced Opus must carry the Opus channel with it...
+        monkeypatch.setattr(quick.config, "QUICK_FORCE_MODEL", "us.anthropic.claude-opus-4-6-v1")
+        assert resolve_model("claude-opus-quick") == "us.anthropic.claude-opus-4-6-v1"
+        # ...without touching the other families' channels.
+        assert resolve_model("claude-sonnet-quick") == "us.anthropic.claude-sonnet-5"
+
+    def test_channel_names_work_with_the_force_disabled(self, monkeypatch):
+        monkeypatch.setattr(quick.config, "QUICK_FORCE_MODEL", "")
+        assert resolve_model("claude-sonnet-quick") == "us.anthropic.claude-sonnet-5"
+        assert resolve_model("claude-opus-quick") == "us.anthropic.claude-opus-4-8"
+
+    def test_provider_prefixed_and_cased_channel_names(self):
+        # litellm may forward the resolved name; casing is the client's business.
+        assert resolve_model("anthropic/claude-sonnet-quick") == "us.anthropic.claude-sonnet-5"
+        assert resolve_model("Claude-Sonnet-Quick") == "us.anthropic.claude-sonnet-5"
+
+    def test_non_channel_names_are_untouched(self):
+        # Only the suffix opts out of the force - a plain Sonnet name still gets Opus.
+        assert resolve_model("claude-sonnet-5") == "us.anthropic.claude-opus-4-8"
+        assert resolve_model("quick") == "us.anthropic.claude-opus-4-8"
+        assert resolve_model("gpt-quick") == "us.anthropic.claude-opus-4-8"
+
+
 @pytest.mark.usefixtures("no_force")
 class TestModelResolutionSuccess:
     def test_alias_and_mode_resolution(self):
@@ -83,11 +116,14 @@ class TestModelResolutionSuccess:
         # Claude Code sends its own names (e.g. "claude-opus-5"); map by family.
         assert resolve_model("claude-opus-5") == "us.anthropic.claude-opus-4-8"  # opus family -> 4-8
         assert resolve_model("Opus") == "us.anthropic.claude-opus-4-8"
-        assert resolve_model("claude-sonnet-5") == "us.anthropic.claude-sonnet-4-6"
+        assert resolve_model("claude-sonnet-9000") == "us.anthropic.claude-sonnet-5"
         assert resolve_model("claude-haiku-9000").startswith("us.anthropic.claude-haiku-4-5")
 
     def test_exact_alias_wins_over_family(self):
         assert resolve_model("claude-opus-4-6") == "us.anthropic.claude-opus-4-6-v1"
+        # sonnet-4-6 is still reachable by name now that the family target is sonnet-5.
+        assert resolve_model("claude-sonnet-4-6") == "us.anthropic.claude-sonnet-4-6"
+        assert resolve_model("claude-sonnet-5") == "us.anthropic.claude-sonnet-5"
 
     def test_passthrough_non_claude_model(self):
         assert resolve_model("some.future.model") == "some.future.model"

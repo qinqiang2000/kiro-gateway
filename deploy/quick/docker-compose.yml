@@ -51,6 +51,8 @@ services:
       # but never dropped from the pool. See quick/README.md "Overage preference".
       - QUICK_POOL_OVERAGE_POLICY=avoid
       # Force every request to the best authorized Opus (opus-5 is IAM-denied).
+      # Exception: the "-quick" channel names litellm publishes (claude-opus-quick,
+      # claude-sonnet-quick) route by their own family - see quick/README.md "Models".
       - QUICK_FORCE_MODEL=us.anthropic.claude-opus-4-8
       # Model watch: poll Quick's PUBLIC model registry every 5 h and alert on a
       # newer model. The webhook URL is a secret -> keep it in /opt/quick-gateway/.env
@@ -78,7 +80,7 @@ services:
       # and lives in .env only (this repo is public).
       - LITELLM_BASE_URL=http://litellm:4000
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-}
-      - LITELLM_QUICK_MODELS=anthropic/claude-opus-quick,claude-opus-quick
+      - LITELLM_QUICK_MODELS=anthropic/claude-opus-quick,claude-opus-quick,anthropic/claude-sonnet-quick,claude-sonnet-quick
     volumes:
       - ./quickwork:/home/kiro/.quickwork
     restart: unless-stopped

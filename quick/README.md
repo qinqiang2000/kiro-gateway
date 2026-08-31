@@ -321,8 +321,8 @@ Two things had to be read off real rows to get it right:
   field off an unfiltered query would report each key's spend across every model in
   the proxy.
 
-The dollar figures are litellm's accounting at its configured rates (quick is priced
-at 1/10 of official Opus list), **not** an AWS invoice — the Quick seats are flat-rate
+The dollar figures are litellm's accounting at its configured rates (each channel at
+1/10 of its own model's official list), **not** an AWS invoice — the Quick seats are flat-rate
 with a unit quota. The page says so, because a ranking in dollars invites the opposite
 reading. The report is cached for `LITELLM_USAGE_CACHE_SECONDS` (the page polls every
 20 s and the query walks a month of daily rows), and a failed refresh serves the last
@@ -332,7 +332,7 @@ good ranking marked stale rather than blanking the tab.
 |-----|---------|
 | `LITELLM_MASTER_KEY` | litellm admin key. **Secret — `.env` only, this repo is public.** Empty = tab off |
 | `LITELLM_BASE_URL` | where litellm lives (default `http://litellm:4000`, over the shared docker network) |
-| `LITELLM_QUICK_MODELS` | model names that count as this channel (default `anthropic/claude-opus-quick,claude-opus-quick`) |
+| `LITELLM_QUICK_MODELS` | model names that count as this channel — **every** published channel, resolved *and* requested spelling (default `anthropic/claude-opus-quick,claude-opus-quick,anthropic/claude-sonnet-quick,claude-sonnet-quick`) |
 | `LITELLM_USAGE_CACHE_SECONDS` | how long a report is served before re-querying (300) |
 
 ## Confirmed protocol
@@ -417,21 +417,47 @@ is JSON, so `source.bytes` is a base64 string, not raw bytes — verified live).
 Authorized for this account (verified live — real completions):
 
 - Opus: `us.anthropic.claude-opus-4-8`, `us.anthropic.claude-opus-4-6-v1`
-- Sonnet: `us.anthropic.claude-sonnet-4-6`
+- Sonnet: `us.anthropic.claude-sonnet-5` (probed 2026-08-31), `us.anthropic.claude-sonnet-4-6`
 - Haiku: `us.anthropic.claude-haiku-4-5-20251001-v1:0`
 
 `us.anthropic.claude-opus-5` **exists on the backend but this account is
 IAM-denied** (explicit deny on `InvokeModelWithResponseStream`) — it returns HTTP
 200 with an in-stream `error` frame, not a completion. So opus-4-8 is the best
-usable Opus.
+usable Opus. Sonnet 5 is the counter-example — the same two-stage check
+(registry, then `--probe`) came back `available`, so the family target for Sonnet
+*is* sonnet-5; entitlement is per model, never a family-wide guess.
 
 **Forcing** — by default the gateway forces *every* request to a single model
 (`QUICK_FORCE_MODEL`, default `us.anthropic.claude-opus-4-8`), ignoring whatever
 the client picked. Set `QUICK_FORCE_MODEL=` (empty) in `.env` to disable and use
 per-request mapping instead: `resolve_model()` then maps any Claude name to a
-Quick id by exact id/alias, else by family (Opus→opus-4-8, Sonnet→sonnet-4-6,
+Quick id by exact id/alias, else by family (Opus→opus-4-8, Sonnet→sonnet-5,
 Haiku→haiku-4-5). The client's `/model` menu (Opus 5, Sonnet 5, …) is its own
 list and is *not* served by this gateway.
+
+### Channels — publishing more than one model from one gateway
+
+A client sending `claude-opus-5` picked that name off *its own* menu and knows
+nothing about Quick; the force exists to overrule it. A name ending in **`-quick`**
+is the opposite: only this gateway answers to those names, so one is a routing
+instruction from whoever configured the channel — and it is the one thing
+`QUICK_FORCE_MODEL` does not override.
+
+| channel (litellm `model_name`) | Quick model |
+|--------------------------------|-------------|
+| `claude-opus-quick` | `us.anthropic.claude-opus-4-8` |
+| `claude-sonnet-quick` | `us.anthropic.claude-sonnet-5` |
+| `claude-haiku-quick` *(unpublished; works if you add it)* | `us.anthropic.claude-haiku-4-5-…` |
+
+The suffix names a **family**, not an id, so the table is derived rather than
+maintained (`QUICK_OPUS_MODEL` / `QUICK_SONNET_MODEL` / `QUICK_HAIKU_MODEL` move a
+whole family, channel included). Within its own family the forced model wins, so
+pointing `QUICK_FORCE_MODEL` at opus-5 the day it is entitled carries
+`claude-opus-quick` along instead of silently leaving it on 4.8.
+
+Both channels share one gateway, one account pool and one quota: the split is about
+which model answers, never about capacity. Add the channel to `LITELLM_QUICK_MODELS`
+too, or the spend tab will rank the pool's quota as if that traffic did not exist.
 
 Backend failures arrive in-stream under HTTP 200: `{"eventType":"error"}` for an IAM
 deny, `{"eventType":"usageLimitExceeded"}` for a blocked entitlement. The gateway
@@ -450,10 +476,13 @@ https://d2tws6r933zatt.cloudfront.net/quickwork/prod/feature_flag_config.json
 It holds the mode→model map (`fast` / `balanced` / `smart`, each with a `.thinking`
 variant) for the base config *and* every staged-rollout override — per region, per
 percentage bucket. A new Claude model appears here (typically as a regional
-percentage canary) before it is worth spending a single inference request. As of
-2026-08-27 it already carries `us.anthropic.claude-sonnet-5` in a 50 % bucket for
-us-west-2 / eu-* / ap-southeast-2, while `smart` is `opus-4-8` there and
-`opus-4-6-v1` in the base config.
+percentage canary) before it is worth spending a single inference request. It carried
+`us.anthropic.claude-sonnet-5` in a 50 % bucket for us-west-2 / eu-* / ap-southeast-2
+on 2026-08-27 and at **99 %** four days later — a rollout watched end to end, and the
+reason `claude-sonnet-quick` exists. `smart` is `opus-4-8` there and `opus-4-6-v1` in
+the base config; our tenant is us-east-1, where `balanced` is still sonnet-4-6 — the
+registry's mode map is the *app's*, and says nothing about what the account may call
+directly (sonnet-5 probes `available` from us-east-1).
 
 So detection is two-stage, and stage 1 never touches the tenant DataPlane:
 
@@ -482,7 +511,10 @@ Every change is logged at WARNING, but **only an upgrade is pushed** to the chat
 An id counts as an **upgrade** when its family is at least as strong *as the baseline*
 and its version is newer — i.e. "a new Opus-class version" when the baseline is Opus.
 `opus-5` beats `opus-4-8`; `sonnet-5` does not, so it is logged and not pushed. Mode
-remaps and retired ids are log-only too.
+remaps and retired ids are log-only too. That is the intended trade and it did cost
+something: sonnet-5 went from canary to 99 % with only WARNING lines to show for it.
+A weaker-family arrival is worth a *look* (is it entitled? worth its own channel?),
+not a page — `--json` on the next cycle is where to find it.
 
 | env | meaning |
 |-----|---------|

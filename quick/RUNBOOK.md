@@ -75,7 +75,10 @@ Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:90
   ~90d, rotates, written back to the file. Daily keep-alive prevents idle lapse. Run on
   ONE host only.
 - `QUICK_FORCE_MODEL` (default opus-4-8) forces every request to one model; opus-5 is
-  IAM-denied. Empty = per-request mapping.
+  IAM-denied. Empty = per-request mapping. **Exception: `…-quick` channel names**
+  (`claude-opus-quick`, `claude-sonnet-quick`) route by their own family and ignore the
+  force — that is how one gateway publishes two models. A new channel needs no code:
+  publish the name in litellm and add it to `LITELLM_QUICK_MODELS`.
 - **web_search** is gateway-executed (key-less DuckDuckGo); **web_fetch**/images pass through.
 - **Prompt caching**: the client's `cache_control` is passed through as Bedrock `cachePoint`,
   capped at 4 (a 5th is a hard 400). The cache is **shared across pool accounts** (measured),
@@ -109,6 +112,20 @@ Add to litellm `config.yaml` (back it up first):
 `api_base: http://quick-gateway:8000/quick`, `model: anthropic/claude-opus-quick`,
 `model_name: claude-opus-quick` → `docker restart litellm`. (Container must share
 litellm's docker network.)
+
+**Two channels are live**, one `api_base`, one account pool, one quota — the name is
+the only thing that differs, and the gateway routes on its `-quick` suffix:
+
+| litellm `model_name` | Quick model | 1/10 of official list |
+|----------------------|-------------|-----------------------|
+| `claude-opus-quick` | `us.anthropic.claude-opus-4-8` | `5.0e-07` / `2.5e-06` |
+| `claude-sonnet-quick` | `us.anthropic.claude-sonnet-5` | `2.0e-07` / `1.0e-06` |
+
+Adding a third (`claude-haiku-quick`) is a litellm entry plus a `LITELLM_QUICK_MODELS`
+entry — no gateway code. Both belong in `LITELLM_QUICK_MODELS` (compose env), or the
+status page's spend tab ranks the pool's quota as if the missing channel's traffic
+never happened. Copy `model_info.access_groups` from the channel next to it, or the new
+name is invisible to every key.
 
 **Cost tracking**: every Claude entry on the box is priced at Anthropic's official list
 rate (as of 2026-08-27: Opus $5/$25, Sonnet 5 $2/$10, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5
