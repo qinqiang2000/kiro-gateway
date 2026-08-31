@@ -105,6 +105,9 @@ PAGE = """<!DOCTYPE html>
           font-variant-numeric:tabular-nums; }
   .scroll { overflow-x:auto; }
   .hint { color:var(--muted); font-size:12px; margin-top:10px; line-height:1.6; }
+  .bar.mini { height:5px; max-width:200px; margin:7px 0 1px; }
+  .split { font-weight:500; color:var(--muted); font-size:12px; margin-top:3px; }
+  .cap { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -132,6 +135,16 @@ PAGE = """<!DOCTYPE html>
       <div><b id="p-reqs">–</b><span>请求数</span></div>
     </div>
     <div class="card">
+      <div class="row"><span class="name">按模型</span>
+        <span class="cap">同一个账号池、同一份配额，只是模型不同</span></div>
+      <div class="scroll"><table>
+        <thead><tr><th>通道</th><th>花费</th><th>占比</th><th>tokens</th><th>缓存读取</th><th>请求</th></tr></thead>
+        <tbody id="chan-rows"><tr><td colspan="6" class="dim">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <div class="row"><span class="name">按虚拟 key</span>
+        <span class="cap">用了不止一个模型的 key，下面一行是它的构成</span></div>
       <div class="scroll"><table>
         <thead><tr><th>虚拟 key</th><th>花费</th><th>tokens</th><th>缓存读取</th><th>请求</th></tr></thead>
         <tbody id="spend-rows"><tr><td colspan="5" class="dim">加载中…</td></tr></tbody>
@@ -217,26 +230,57 @@ function renderSpend(d) {
   document.getElementById("p-tokens").textContent = big(t.total_tokens || 0);
   document.getElementById("p-reqs").textContent = big(t.requests || 0);
 
+  // Per model. The share is of spend, which is what the tiles above are counting;
+  // tokens sit next to it because a Quick unit is charged by tokens, not by model.
+  const chans = d.channels || [];
+  document.getElementById("chan-rows").innerHTML = chans.length
+    ? chans.map(c => {
+        const share = t.spend ? 100 * c.spend / t.spend : 0;
+        return "<tr><td class='who'>" + esc(c.channel)
+          + "<div class='bar mini'><i style='width:" + share.toFixed(1)
+          + "%;background:var(--ok)'></i></div></td>"
+          + "<td class='num'>" + money(c.spend) + "</td>"
+          + "<td class='num dim'>" + share.toFixed(0) + "%</td>"
+          + "<td class='num'>" + big(c.total_tokens) + "</td>"
+          + "<td class='num dim'>" + big(c.cache_read_tokens) + "</td>"
+          + "<td class='num'>" + big(c.requests)
+          + (c.failed ? " <span style='color:var(--bad)'>(" + c.failed + " 失败)</span>" : "")
+          + "</td></tr>";
+      }).join("")
+    : "<tr><td colspan='6' class='dim'>本月还没有任何通道的调用记录。</td></tr>";
+
+  // A key's split is only worth a line when it actually used more than one model.
+  const short = Object.fromEntries(chans.map(c => [c.channel, c.label || c.channel]));
+  const split = k => {
+    const used = Object.entries(k.channels || {}).filter(c => c[1].requests || c[1].spend);
+    return used.length < 2 ? ""
+      : "<div class='split'>" + used.sort((a, b) => b[1].spend - a[1].spend)
+          .map(c => esc(short[c[0]] || c[0]) + " " + money(c[1].spend)).join(" · ") + "</div>";
+  };
+
   const rows = d.keys || [];
   document.getElementById("spend-rows").innerHTML = rows.length
     ? rows.map((k, i) =>
-        "<tr><td class='who'><span class='rank'>" + (i + 1) + "</span>" + esc(k.alias) + "</td>"
+        "<tr><td class='who'><span class='rank'>" + (i + 1) + "</span>" + esc(k.alias)
+        + split(k) + "</td>"
         + "<td class='num'>" + money(k.spend) + "</td>"
         + "<td class='num'>" + big(k.total_tokens) + "</td>"
         + "<td class='num dim'>" + big(k.cache_read_tokens) + "</td>"
         + "<td class='num'>" + big(k.requests)
         + (k.failed ? " <span style='color:var(--bad)'>(" + k.failed + " 失败)</span>" : "")
         + "</td></tr>").join("")
-    : "<tr><td colspan='5' class='dim'>本月还没有这个通道的调用记录。</td></tr>";
+    : "<tr><td colspan='5' class='dim'>本月还没有这个网关的调用记录。</td></tr>";
 
   const note = d.error
     ? "<span style='color:var(--bad)'>" + esc(d.error) + "</span><br>"
     : "";
   document.getElementById("spend-hint").innerHTML = note
-    + "统计口径：litellm 记录的 " + esc((d.models || []).join(" / "))
-    + "，" + esc(d.start || "") + " ~ " + esc(d.end || "") + "（UTC）。"
-    + "金额是 litellm 按配置单价的记账（quick = 官方 Opus 的 1/10），"
-    + "不是 AWS 账单——Quick 席位是包月配额制。"
+    + "统计口径：" + esc(chans.map(c => c.channel).join(" / ") || (d.models || []).join(" / "))
+    + "（成功记解析后的名字、失败记请求时的名字，已合并），"
+    + esc(d.start || "") + " ~ " + esc(d.end || "") + "（UTC）。"
+    + "金额是 litellm 按配置单价的记账（每条通道 = 各自官方 list 的 1/10），"
+    + "不是 AWS 账单——Quick 席位是包月配额制，而且 unit 只按 token 算、不分模型，"
+    + "所以美元占比不等于配额占比。"
     + (d.cache_age_seconds ? "缓存 " + Math.round(d.cache_age_seconds) + " 秒前。" : "");
 }
 

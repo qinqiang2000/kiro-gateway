@@ -286,7 +286,7 @@ a boundary — `QUICK_STATUS_TOKEN` is the boundary.
 | tab | question it answers | source |
 |-----|---------------------|--------|
 | 账号额度 | how much Quick allowance is left, per account | the pool's own readings |
-| 本月花费排名 | **which virtual key spent it**, this month | litellm (`litellm_usage.py`) |
+| 本月花费排名 | **which model, and which virtual key**, this month | litellm (`litellm_usage.py`) |
 
 It renders no credential material — no token, tenant URL, user ARN, and never a key,
 only labels: account names come from *filenames*, spender names are litellm **key
@@ -309,6 +309,17 @@ so the gateway never sees a client key. litellm can, and the tab reads it from
 one that gives per-key **and** per-model numbers on a community licence:
 `/global/spend/report` is enterprise-gated (403 with a licence pitch) and
 `/global/spend/keys` is per-key but all-models with no token counts.
+
+It reports **per channel and per key**, from one walk of the month: each row is
+counted into the key's total and into the channel its query was filtered to. So the
+tab shows what `claude-opus-quick` and `claude-sonnet-quick` each cost (with the
+share of the month's spend), and a key that used both gets its split under its name.
+Channels the model watch has never published simply do not appear.
+
+The dollars are not the quota, and the page says so: a Quick unit is charged by
+tokens and does not care which model produced them, while each channel is priced at
+1/10 of *its own* official list — so a dollar share is not a unit share. Tokens sit
+in the next column for exactly that reason.
 
 Two things had to be read off real rows to get it right:
 

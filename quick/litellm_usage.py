@@ -23,6 +23,12 @@ Two subtleties, both found by reading real rows:
   the same field off an unfiltered query would hand back each key's whole spend
   across every model in the proxy.
 
+That per-model filter is also what gives the page its second dimension: the rows are
+counted twice, once into the key's total and once into the **channel** the query was
+filtered to, so the tab answers "which key" and "which model" from one walk of the
+month. The channel is the model name with its provider prefix stripped, which is what
+folds the resolved and requested spellings back into one row.
+
 The dollar figures are litellm's own accounting at the rates in its config (each Quick
 channel is priced at 1/10 of its own model's official list), **not** an AWS invoice: a
 Quick unit is charged by tokens and not by model, so the ranking orders people by what
@@ -32,7 +38,7 @@ the number worth ranking people by.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +46,7 @@ import httpx
 from loguru import logger
 
 from quick.config import (
+    QUICK_CHANNEL_SUFFIX,
     LITELLM_BASE_URL,
     LITELLM_MASTER_KEY,
     LITELLM_QUICK_MODELS,
@@ -55,11 +62,9 @@ _MAX_PAGES: int = 50
 
 
 @dataclass
-class KeySpend:
-    """One virtual key's consumption of this channel, for the month so far."""
+class Metrics:
+    """litellm's numbers for one slice, summed over days (and over channels, for a key)."""
 
-    key_hash: str
-    alias: str = ""
     spend: float = 0.0
     total_tokens: int = 0
     prompt_tokens: int = 0
@@ -69,6 +74,90 @@ class KeySpend:
     requests: int = 0
     successful: int = 0
     failed: int = 0
+
+    def add(self, metrics: JsonDict) -> None:
+        """Fold in one day's raw ``metrics`` block for one key.
+
+        Args:
+            metrics: The ``metrics`` object litellm returns per key per day.
+        """
+        self.spend += float(metrics.get("spend") or 0.0)
+        self.total_tokens += int(metrics.get("total_tokens") or 0)
+        self.prompt_tokens += int(metrics.get("prompt_tokens") or 0)
+        self.completion_tokens += int(metrics.get("completion_tokens") or 0)
+        self.cache_read_tokens += int(metrics.get("cache_read_input_tokens") or 0)
+        self.cache_write_tokens += int(metrics.get("cache_creation_input_tokens") or 0)
+        self.requests += int(metrics.get("api_requests") or 0)
+        self.successful += int(metrics.get("successful_requests") or 0)
+        self.failed += int(metrics.get("failed_requests") or 0)
+
+    def merge(self, other: "Metrics") -> None:
+        """Add an already-summed block (a channel into a key, a key into the total)."""
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+    def to_dict(self) -> JsonDict:
+        """Render for the status page."""
+        return {
+            "spend": round(self.spend, 6),
+            "total_tokens": self.total_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "requests": self.requests,
+            "successful": self.successful,
+            "failed": self.failed,
+        }
+
+
+def channel_of(model: str) -> str:
+    """The channel a litellm model name belongs to (its provider prefix stripped).
+
+    litellm records the resolved name (``anthropic/claude-opus-quick``) on a success
+    and the requested one (``claude-opus-quick``) on a failure. Those are one channel
+    under two spellings: split apart on the page they would read as two models, one of
+    which only ever fails.
+
+    Args:
+        model: A litellm model name, as configured or as recorded on a row.
+
+    Returns:
+        The channel name (``claude-opus-quick``).
+    """
+    return (model or "").rsplit("/", 1)[-1].strip()
+
+
+def channel_label(channel: str) -> str:
+    """Short display name for a channel: ``claude-sonnet-quick`` -> ``sonnet``.
+
+    Args:
+        channel: A channel name from :func:`channel_of`.
+
+    Returns:
+        The distinguishing middle of the name, or the name itself when trimming it
+        would leave nothing.
+    """
+    short = channel[len("claude-"):] if channel.startswith("claude-") else channel
+    if short.endswith(QUICK_CHANNEL_SUFFIX):
+        short = short[: -len(QUICK_CHANNEL_SUFFIX)]
+    return short or channel
+
+
+@dataclass
+class KeySpend:
+    """One virtual key's consumption of this gateway, for the month so far."""
+
+    key_hash: str
+    alias: str = ""
+    totals: Metrics = field(default_factory=Metrics)
+    # Per channel, because the pool's quota is shared but the models are not: "who
+    # spent it" is only half the question once more than one model is published.
+    channels: Dict[str, Metrics] = field(default_factory=dict)
+
+    def channel(self, name: str) -> Metrics:
+        """The accumulator for one channel, created on first use."""
+        return self.channels.setdefault(name, Metrics())
 
     def label(self) -> str:
         """Display name: the key alias, else something safe to print.
@@ -87,19 +176,14 @@ class KeySpend:
 
     def to_dict(self) -> JsonDict:
         """Render for the status page. Carries no key material — alias and hash only."""
-        return {
-            "key": self.key_hash[:8],
-            "alias": self.label(),
-            "spend": round(self.spend, 6),
-            "total_tokens": self.total_tokens,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "cache_read_tokens": self.cache_read_tokens,
-            "cache_write_tokens": self.cache_write_tokens,
-            "requests": self.requests,
-            "successful": self.successful,
-            "failed": self.failed,
+        row: JsonDict = {"key": self.key_hash[:8], "alias": self.label()}
+        row.update(self.totals.to_dict())
+        row["channels"] = {
+            name: metrics.to_dict()
+            for name, metrics in sorted(self.channels.items(),
+                                        key=lambda kv: (-kv[1].spend, kv[0]))
         }
+        return row
 
 
 @dataclass
@@ -145,12 +229,14 @@ def month_window(today: Optional[date] = None) -> Tuple[str, str, str]:
     return start.isoformat(), now.isoformat(), now.strftime("%Y-%m")
 
 
-def _merge(into: Dict[str, KeySpend], breakdown: JsonDict) -> None:
+def _merge(into: Dict[str, KeySpend], breakdown: JsonDict, channel: str) -> None:
     """Fold one day's per-key metrics into the running totals.
 
     Args:
         into: Accumulator keyed by the key's hash.
         breakdown: A day's ``breakdown`` object from the activity endpoint.
+        channel: The channel this day's query was filtered to — counted twice, once
+            into the key's total and once into its per-channel split.
     """
     for key_hash, entry in (breakdown.get("api_keys") or {}).items():
         if not isinstance(entry, dict):
@@ -159,15 +245,8 @@ def _merge(into: Dict[str, KeySpend], breakdown: JsonDict) -> None:
         meta = entry.get("metadata") or {}
         row = into.setdefault(key_hash, KeySpend(key_hash=key_hash))
         row.alias = row.alias or (meta.get("key_alias") or "")
-        row.spend += float(metrics.get("spend") or 0.0)
-        row.total_tokens += int(metrics.get("total_tokens") or 0)
-        row.prompt_tokens += int(metrics.get("prompt_tokens") or 0)
-        row.completion_tokens += int(metrics.get("completion_tokens") or 0)
-        row.cache_read_tokens += int(metrics.get("cache_read_input_tokens") or 0)
-        row.cache_write_tokens += int(metrics.get("cache_creation_input_tokens") or 0)
-        row.requests += int(metrics.get("api_requests") or 0)
-        row.successful += int(metrics.get("successful_requests") or 0)
-        row.failed += int(metrics.get("failed_requests") or 0)
+        row.totals.add(metrics)
+        row.channel(channel).add(metrics)
 
 
 async def _fetch_model(
@@ -195,7 +274,7 @@ async def _fetch_model(
         resp.raise_for_status()
         body = resp.json()
         for day in body.get("results") or []:
-            _merge(into, day.get("breakdown") or {})
+            _merge(into, day.get("breakdown") or {}, channel_of(model))
         meta = body.get("metadata") or {}
         total_pages = int(meta.get("total_pages") or 1)
         if not meta.get("has_more") and page >= total_pages:
@@ -222,10 +301,8 @@ async def fetch_monthly_spend(today: Optional[date] = None) -> JsonDict:
     start, end, month = month_window(today)
     report: JsonDict = {
         "month": month, "start": start, "end": end,
-        "models": quick_model_names(), "keys": [],
-        "totals": {"spend": 0.0, "total_tokens": 0, "prompt_tokens": 0,
-                   "completion_tokens": 0, "cache_read_tokens": 0,
-                   "requests": 0, "successful": 0, "failed": 0},
+        "models": quick_model_names(), "channels": [], "keys": [],
+        "totals": Metrics().to_dict(),
         "generated_at": time.time(), "error": "",
     }
     if not LITELLM_MASTER_KEY:
@@ -239,19 +316,24 @@ async def fetch_monthly_spend(today: Optional[date] = None) -> JsonDict:
         for model in quick_model_names():
             await _fetch_model(client, model, start, end, rows)
 
-    ranked = sorted(rows.values(), key=lambda r: (-r.spend, -r.total_tokens, r.label()))
+    ranked = sorted(rows.values(),
+                    key=lambda r: (-r.totals.spend, -r.totals.total_tokens, r.label()))
     report["keys"] = [row.to_dict() for row in ranked]
-    totals = report["totals"]
+
+    # Both the per-channel and the grand total are folded up from the same per-key
+    # numbers, so the three views on the page cannot disagree with each other.
+    channels: Dict[str, Metrics] = {}
+    grand = Metrics()
     for row in ranked:
-        totals["spend"] += row.spend
-        totals["total_tokens"] += row.total_tokens
-        totals["prompt_tokens"] += row.prompt_tokens
-        totals["completion_tokens"] += row.completion_tokens
-        totals["cache_read_tokens"] += row.cache_read_tokens
-        totals["requests"] += row.requests
-        totals["successful"] += row.successful
-        totals["failed"] += row.failed
-    totals["spend"] = round(totals["spend"], 6)
+        grand.merge(row.totals)
+        for name, metrics in row.channels.items():
+            channels.setdefault(name, Metrics()).merge(metrics)
+    report["channels"] = [
+        dict(channel=name, label=channel_label(name), **metrics.to_dict())
+        for name, metrics in sorted(channels.items(),
+                                    key=lambda kv: (-kv[1].spend, -kv[1].total_tokens, kv[0]))
+    ]
+    report["totals"] = grand.to_dict()
     return report
 
 
@@ -284,7 +366,7 @@ async def monthly_spend(force: bool = False) -> JsonDict:
             return stale
         start, end, month = month_window()
         return {"month": month, "start": start, "end": end, "models": quick_model_names(),
-                "keys": [], "totals": {}, "generated_at": time.time(),
+                "channels": [], "keys": [], "totals": {}, "generated_at": time.time(),
                 "error": f"读取 litellm 失败：{exc}"}
     if not report.get("error"):
         _cache.payload = report

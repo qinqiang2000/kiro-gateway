@@ -1644,6 +1644,82 @@ class TestLitellmSpendSuccess:
         assert row["requests"] == 9 and row["failed"] == 7
 
     @pytest.mark.asyncio
+    async def test_spend_is_split_per_channel(self, litellm_env, monkeypatch):
+        """Two published models, one pool: the page has to be able to tell them apart."""
+        monkeypatch.setattr(litellm_env, "LITELLM_QUICK_MODELS",
+                            "anthropic/claude-opus-quick,anthropic/claude-sonnet-quick")
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/claude-opus-quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(spend=3.0, total=30,
+                                                                   requests=3, ok=3))}),
+            ], "metadata": {"total_pages": 1}},
+            "anthropic/claude-sonnet-quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(spend=1.0, total=50,
+                                                                   requests=2, ok=2))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert [(c["channel"], c["label"], c["spend"], c["total_tokens"])
+                for c in report["channels"]] == [
+            ("claude-opus-quick", "opus", 3.0, 30),      # ranked by spend...
+            ("claude-sonnet-quick", "sonnet", 1.0, 50),  # ...not by tokens
+        ]
+        row = report["keys"][0]
+        assert row["spend"] == 4.0 and row["total_tokens"] == 80
+        assert row["channels"]["claude-sonnet-quick"]["requests"] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_two_spellings_of_one_channel_stay_one_row(self, litellm_env,
+                                                                 monkeypatch):
+        """Resolved name + requested name = one channel, or a channel that only fails."""
+        _fake_litellm(monkeypatch, litellm_env, {
+            "anthropic/quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(spend=1.0, requests=1,
+                                                                   ok=1))}),
+            ], "metadata": {"total_pages": 1}},
+            "quick": {"results": [
+                _activity_day("2026-08-01", {"h": ("张三", _metrics(requests=4, failed=4))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert [c["channel"] for c in report["channels"]] == ["quick"]
+        assert report["channels"][0]["requests"] == 5
+        assert report["channels"][0]["failed"] == 4
+
+    @pytest.mark.asyncio
+    async def test_channel_totals_add_up_to_the_grand_total(self, litellm_env, monkeypatch):
+        """The three views on the page are folded from one set of numbers, so they agree."""
+        monkeypatch.setattr(litellm_env, "LITELLM_QUICK_MODELS", "a-quick,b-quick")
+        _fake_litellm(monkeypatch, litellm_env, {
+            "a-quick": {"results": [
+                _activity_day("2026-08-01", {"h1": ("张三", _metrics(spend=2.0, total=20,
+                                                                    requests=2, ok=2))}),
+            ], "metadata": {"total_pages": 1}},
+            "b-quick": {"results": [
+                _activity_day("2026-08-02", {"h2": ("李四", _metrics(spend=0.5, total=5,
+                                                                    requests=1, ok=1))}),
+            ], "metadata": {"total_pages": 1}},
+        })
+
+        report = await litellm_env.fetch_monthly_spend()
+
+        assert sum(c["spend"] for c in report["channels"]) == report["totals"]["spend"]
+        assert sum(k["spend"] for k in report["keys"]) == report["totals"]["spend"]
+        assert sum(c["requests"] for c in report["channels"]) == report["totals"]["requests"]
+
+    def test_channel_label_keeps_what_distinguishes_the_channel(self, litellm_env):
+        assert litellm_env.channel_label("claude-sonnet-quick") == "sonnet"
+        assert litellm_env.channel_label("claude-opus-quick") == "opus"
+        # Nothing left to trim -> the name itself, never an empty label.
+        assert litellm_env.channel_label("quick") == "quick"
+        assert litellm_env.channel_label("-quick") == "-quick"
+        assert litellm_env.channel_of("anthropic/claude-opus-quick") == "claude-opus-quick"
+
+    @pytest.mark.asyncio
     async def test_the_query_is_filtered_to_this_channel(self, litellm_env, monkeypatch):
         """Without model=, breakdown.api_keys would be each key's spend on EVERY model."""
         calls = []
