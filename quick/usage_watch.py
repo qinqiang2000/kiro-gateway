@@ -773,7 +773,7 @@ def _num_pct(report: JsonDict, key: str) -> str:
 
 def _log_pool(snapshot: JsonDict) -> None:
     """Render the pool table as human-readable log lines."""
-    logger.info("Quick pool: {}/{} accounts ready (avg {}% session left).",
+    logger.info("Quick pool: {}/{} accounts ready (avg {}% of the tighter allowance left).",
                 snapshot.get("ready"), snapshot.get("total"),
                 _num_pct(snapshot, "pool_remaining_pct"))
     for entry in snapshot.get("accounts", []):

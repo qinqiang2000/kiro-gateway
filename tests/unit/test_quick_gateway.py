@@ -1174,6 +1174,29 @@ class TestPoolSelectionSuccess:
 
         assert picks == ["default", "b", "default", "b"]  # alternates, never sticks
 
+    def test_monthly_headroom_decides_when_the_session_meters_agree(self, pool_env):
+        """The session window is not what hard-blocks an account; the month is."""
+        _reading("default", 0, monthly_used=96, units=40)   # fresh window, month nearly out
+        _reading("b", 0, monthly_used=30, units=756)
+
+        assert pool_env.select().name == "b"
+
+    def test_the_session_still_binds_when_it_is_the_tighter_one(self, pool_env):
+        _reading("default", 95, monthly_used=0, units=1080)  # 5% session left
+        _reading("b", 20, monthly_used=40, units=648)        # 80% session, 60% month
+
+        assert pool_env.select().name == "b"
+
+    def test_a_reading_past_its_own_reset_stops_ranking_the_account(self, pool_env):
+        """Units do not roll over: at the reset, "spent" becomes last month's fact."""
+        _reading("default", 0, monthly_used=100, units=0, resets_at=1)  # long past
+        _reading("b", 0, monthly_used=50, units=540)
+
+        account = pool_env.get("default")
+        assert account.monthly_remaining() is None      # expired -> unknown, not 0
+        assert account.monthly_exhausted() is False     # so it is not benched either
+        assert pool_env.select().name == "default"      # unknown counts as full
+
     def test_exclude_skips_an_already_tried_account(self, pool_env):
         _reading("default", 10)
 
@@ -2106,13 +2129,22 @@ class TestOveragePreference:
         assert account.eligible() is True
         assert account.cooling() is False
 
-    def test_allow_ranks_purely_on_the_session_allowance(self, pool_env, policy):
+    def test_allow_does_not_demote_the_account_that_is_paying(self, pool_env, policy):
         policy("allow")
-        _reading("default", 10, monthly_used=100, units=0, overage=True)
-        _reading("b", 60, monthly_used=20, units=576, overage=True)
+        # Same headroom bucket (10 % vs 15 % of the binding allowance left), so the
+        # demotion is the only thing that could separate them — and 'default', which
+        # is spent and billing overage, has the whole session window to itself.
+        _reading("default", 0, monthly_used=90, units=0, overage=True)
+        _reading("b", 85, monthly_used=0, units=1080, overage=True)
 
-        # 90 % session left beats 40 %, whoever pays for it.
         assert pool_env.select().name == "default"
+
+    def test_avoid_demotes_it_inside_that_same_bucket(self, pool_env, policy):
+        policy("avoid")
+        _reading("default", 0, monthly_used=90, units=0, overage=True)
+        _reading("b", 85, monthly_used=0, units=1080, overage=True)
+
+        assert pool_env.select().name == "b"
 
     def test_an_unmeasured_account_is_not_treated_as_on_overage(self, pool_env, policy):
         policy("avoid")

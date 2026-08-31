@@ -122,7 +122,7 @@ PAGE = """<!DOCTYPE html>
   <div id="pane-pool">
     <div class="sum">
       <div><b id="s-ready">–</b><span>可用账号</span></div>
-      <div><b id="s-avg">–</b><span>平均剩余会话额度</span></div>
+      <div><b id="s-avg">–</b><span>平均剩余额度（取更紧的）</span></div>
       <div><b id="s-inflight">–</b><span>进行中请求</span></div>
     </div>
     <div id="list"></div>
@@ -191,6 +191,11 @@ function render(d) {
       ? (a.overage_enabled ? "，已超额（overage 兜底，仍可用）" : "，已用尽") : "";
     const monthly = a.monthly_used_pct === null || a.monthly_used_pct === undefined
       ? "" : "月度已用 " + pct(a.monthly_used_pct) + units + over;
+    // Which number the pool actually ranks this account on, so a card showing "100%
+    // 会话额度剩余" while sitting at the back of the queue explains itself.
+    const rank = a.headroom_pct === null || a.headroom_pct === undefined ? ""
+      : "排序依据 " + pct(a.headroom_pct)
+        + (a.binding_allowance === "monthly" ? "（月度更紧）" : "（会话更紧）");
     return '<div class="card' + (a.status === "disabled" ? " dim" : "") + '">'
       + '<div class="row"><span class="name">' + esc(a.name) + "</span>"
       + '<span class="pill ' + a.status + '">' + (label[a.status] || a.status) + "</span></div>"
@@ -199,6 +204,7 @@ function render(d) {
       + '<div class="bar"><i style="width:' + (v === null || v === undefined ? 0 : Math.max(0, Math.min(100, v)))
       + '%;background:' + color(v) + '"></i></div>'
       + '<div class="meta"><span>' + monthly + "</span>"
+      + (rank ? "<span>" + rank + "</span>" : "")
       + "<span>最后使用 " + ago(a.last_used_ago_seconds) + "</span>"
       + "<span>已服务 " + a.served + " 次</span>"
       + (a.inflight ? "<span>进行中 " + a.inflight + "</span>" : "")

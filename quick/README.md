@@ -106,13 +106,38 @@ the key down with it.
 1. drop accounts that are disabled or cooling down;
 2. apply the **overage preference** (below) — while some account still has monthly
    units, a spent one is ordered last (it is never dropped);
-3. rank by remaining session share, **bucketed** to 10 % (`QUICK_POOL_QUOTA_BUCKET`) —
-   ranking on the raw percentage would ping-pong the choice on every reading;
-4. break ties by in-flight requests, then by requests served — round-robin within a
+3. rank by the **tighter of the session and monthly shares**, bucketed to 10 %
+   (`QUICK_POOL_QUOTA_BUCKET`) — ranking on the raw percentage would ping-pong the
+   choice on every reading;
+4. then by the session share alone, which still separates accounts once every
+   monthly bucket is spent and overage is carrying the pool;
+5. break ties by in-flight requests, then by requests served — round-robin within a
    bucket, which also spreads the first requests before any reading exists.
 
 An unmeasured account counts as full, so a freshly added one gets the first request
 (which produces the reading that then ranks it honestly).
+
+> **Rank on what actually stops the account** (learned live 2026-08-31). Selection
+> used to read the session share only. The session window is what throttles an account
+> minute to minute, but the *monthly* entitlement is what hard-blocks it — with overage
+> off, spending the last unit earns `BLOCKED_MONTHLY` until the reset, not a bill. An
+> account reading a fresh session window and 4 % of its month left was ranked top and
+> walked straight into that. Live, the same rule produced the mirror image: one account
+> read 0 % session used and took **every** request while the other, holding a 28 % older
+> session reading, served none — and readings only refresh from real traffic, so the
+> account that is not chosen keeps its stale number and stays unchosen. Taking the
+> tighter of the two also spends the pool evenly by *fraction* consumed, which is the
+> fair split when the accounts belong to different people and their limit profiles
+> differ in size. `snapshot()` reports `headroom_pct` and `binding_allowance`, and the
+> status page prints them, so a card showing "100 % 会话额度剩余" at the back of the
+> queue explains itself.
+
+> **A reading expires by its own statement.** Every monthly reading carries `resetsAt`;
+> past that moment "0 units left" is last month's fact. Since the pool only re-reads an
+> account it *selects*, ranking on an expired reading would keep a spent account at the
+> bottom straight through the reset that refilled it. So past `resetsAt` the monthly
+> figures count as unknown — which also means the account is no longer treated as
+> exhausted for the overage preference.
 
 ### Failover
 
@@ -234,7 +259,10 @@ account whose monthly entitlement is spent (so Quick serves it on overage):
 | value | behaviour |
 |-------|-----------|
 | `avoid` *(default)* | pick it last, while any account still has monthly headroom |
-| `allow` | ignore the distinction and rank purely on the session allowance |
+| `allow` | no demotion — it is ranked like any other account |
+
+Note this is now a *demotion* switch only: the monthly share enters the ranking above
+either way, so `allow` no longer means "rank on the session alone".
 
 An unrecognised value falls back to `avoid`. The deprecated
 `QUICK_POOL_AVOID_OVERAGE=1` still forces `avoid`.

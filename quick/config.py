@@ -87,7 +87,10 @@ QUICK_POOL_AVOID_OVERAGE: bool = os.getenv("QUICK_POOL_AVOID_OVERAGE", "0").lowe
 
 # How the pool ORDERS an account whose monthly entitlement is spent:
 #   avoid — pick it last, while any account still has monthly headroom   (default)
-#   allow — ignore the distinction and rank purely on the session allowance
+#   allow — no demotion; it is ranked like any other account
+# Either way the monthly share now enters the ranking itself (select() ranks on the
+# TIGHTER of the session and monthly shares), so "allow" is no longer "session only" —
+# it only drops the hard demotion.
 # This is a preference, never an eviction: an account leaves the pool only when it
 # actually stops working. A spent account that Quick still serves keeps serving.
 QUICK_POOL_OVERAGE_POLICY: str = os.getenv("QUICK_POOL_OVERAGE_POLICY", "avoid").strip().lower()

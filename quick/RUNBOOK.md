@@ -66,7 +66,9 @@ Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:90
 
 - Container runs as **uid 999** — the mounted `quickwork/` creds must be owned by 999.
 - **Account pool**: every `quickwork/gateway-creds*.json` is one account (`…-b.json` → `b`).
-  Requests go to the account with the most session allowance left, with failover; a
+  Requests go to the account with the most headroom left — the *tighter* of its session
+  and monthly shares, since with overage off the month is what hard-blocks it (the status
+  page prints which one is binding) — with failover; a
   malformed request (400) is never retried on a second account. `/quick/pin/b/v1/messages`
   pins one account. State files in the same dir are not mistaken for creds.
 - **`REFRESH_TOKEN=dummy`** in the compose only passes `main.py`'s startup check; Kiro

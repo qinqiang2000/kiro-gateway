@@ -18,8 +18,10 @@ carries a ``usageSummary`` (:mod:`quick.usage_watch`), so the gateway always kno
 each account's remaining share. Selection is therefore:
 
 1. drop accounts that are disabled or cooling down,
-2. rank by remaining session share, bucketed (raw percentages would ping-pong the
-   choice between two accounts on every reading),
+2. rank by the **tighter of the session and monthly shares** — whichever allowance
+   runs out first is the one that will stop the account — bucketed (raw percentages
+   would ping-pong the choice between two accounts on every reading), then by the
+   session share alone, which still discriminates once every monthly bucket is spent,
 3. break ties by in-flight requests, then by requests served (round-robin within a
    bucket, which also spreads the very first requests before any reading exists).
 
@@ -212,14 +214,28 @@ class Account:
             return "cooling"
         return "ready"
 
+    def monthly_reading_expired(self, now: Optional[float] = None) -> bool:
+        """True once a reading's own ``resetsAt`` has passed.
+
+        A reading states when its month ends; past that moment "0 units left" is not a
+        fact about the account any more, it is last month's fact. This matters because
+        the pool only re-reads an account it *selects*: ranking a spent account last on
+        an expired reading would keep it there straight through the reset that refilled
+        it. Unknown reset time means the reading never expires on its own.
+        """
+        usage = self.usage
+        resets = usage.monthly_resets_at if usage else None
+        return bool(resets) and (now or time.time()) >= resets
+
     def monthly_exhausted(self) -> bool:
         """True when this account's monthly entitlement is spent.
 
-        Unknown (no reading yet) counts as *not* exhausted — an unmeasured account
-        must still get its first request, which is what produces the reading.
+        Unknown (no reading yet, or one that has outlived its own reset) counts as
+        *not* exhausted — an unmeasured account must still get its first request,
+        which is what produces the reading.
         """
         usage = self.usage
-        if usage is None:
+        if usage is None or self.monthly_reading_expired():
             return False
         if usage.monthly_available_units is not None:
             return usage.monthly_available_units <= 0
@@ -248,11 +264,40 @@ class Account:
         return usage.session_remaining_pct if usage else None
 
     def monthly_remaining(self) -> Optional[float]:
-        """Remaining share of the monthly entitlement, if known."""
+        """Remaining share of the monthly entitlement, if the reading still applies."""
         usage = self.usage
-        if usage is None or usage.monthly_used_pct is None:
+        if usage is None or usage.monthly_used_pct is None or self.monthly_reading_expired():
             return None
         return max(0.0, 100.0 - usage.monthly_used_pct)
+
+    def headroom(self) -> Optional[float]:
+        """Remaining share of whichever allowance runs out first, if any is known.
+
+        Selection ranks on this rather than on the session share alone. The session
+        window is what throttles an account minute to minute, but the monthly
+        entitlement is what *hard-blocks* it — with overage off, spending the last unit
+        earns a BLOCKED_MONTHLY refusal until the reset, not a bill. An account with a
+        full session window and 4 % of its month left is one request from being benched
+        for days, and ranking it top (as the session share alone did) walked straight
+        into that. Ranking on the tighter of the two also spends the pool evenly by
+        *fraction* consumed, which is the fair split when the accounts belong to
+        different people and their limit profiles differ in size.
+
+        Unknown counts as full: a freshly added account must still get its first
+        request, which is what produces the reading that then ranks it honestly.
+        """
+        known = [v for v in (self.session_remaining(), self.monthly_remaining())
+                 if v is not None]
+        return min(known) if known else None
+
+    def binding_allowance(self) -> str:
+        """Which allowance :meth:`headroom` is reporting — for the status page."""
+        session, monthly = self.session_remaining(), self.monthly_remaining()
+        if session is None and monthly is None:
+            return ""
+        if monthly is None or (session is not None and session <= monthly):
+            return "session"
+        return "monthly"
 
 
 def _bucket(value: Optional[float], width: int) -> int:
@@ -407,6 +452,11 @@ class QuickPool:
 
         candidates.sort(
             key=lambda a: (
+                -_bucket(a.headroom(), width),
+                # Then the session share. Once every account's monthly bucket is spent
+                # (overage carrying the pool), the binding number is 0 everywhere and
+                # would stop discriminating — but session throttling is still real, and
+                # it is the dimension that moves minute to minute.
                 -_bucket(a.session_remaining(), width),
                 a.inflight,
                 a.served,
@@ -671,6 +721,8 @@ class QuickPool:
                 "monthly_available_units": usage.monthly_available_units if usage else None,
                 "monthly_provisioned_units": usage.monthly_provisioned_units if usage else None,
                 "monthly_resets_at": usage.monthly_resets_at if usage else None,
+                "headroom_pct": account.headroom(),
+                "binding_allowance": account.binding_allowance(),
                 "overage_enabled": bool(usage.overage_enabled) if usage else False,
                 "on_overage": account.on_overage(),
                 "entitlement_status": usage.entitlement_status if usage else "",
@@ -684,7 +736,10 @@ class QuickPool:
                 "last_used_ago_seconds": round(now - account.last_used, 1) if account.last_used else None,
             })
         ready = [a for a in accounts if a["status"] == "ready"]
-        known = [a["session_remaining_pct"] for a in ready if a["session_remaining_pct"] is not None]
+        # Averaged over the *binding* allowance, not the session one: an average that
+        # reads 100% while every account is out of monthly units is worse than no
+        # number at all — it is the pool's headline, and it should mean "capacity".
+        known = [a["headroom_pct"] for a in ready if a["headroom_pct"] is not None]
         return {
             "accounts": accounts,
             "total": len(accounts),
