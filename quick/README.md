@@ -106,13 +106,26 @@ the key down with it.
 1. drop accounts that are disabled or cooling down;
 2. apply the **overage preference** (below) — while some account still has monthly
    units, a spent one is ordered last (it is never dropped);
-3. rank by the **tighter of the session and monthly shares**, bucketed to 10 %
+3. **spread concurrency**: an account already carrying `QUICK_POOL_SOFT_INFLIGHT`
+   (default 2) requests is ranked behind any account carrying fewer — a demotion, not
+   a limit, so when every account is at the cap the quota ranking decides as before;
+4. rank by the **tighter of the session and monthly shares**, bucketed to 10 %
    (`QUICK_POOL_QUOTA_BUCKET`) — ranking on the raw percentage would ping-pong the
    choice on every reading;
-4. then by the session share alone, which still separates accounts once every
+5. then by the session share alone, which still separates accounts once every
    monthly bucket is spent and overage is carrying the pool;
-5. break ties by in-flight requests, then by requests served — round-robin within a
+6. break ties by in-flight requests, then by requests served — round-robin within a
    bucket, which also spreads the first requests before any reading exists.
+
+> **Quota ranking alone hands a burst to one account.** In-flight only ever broke a
+> tie *inside* a bucket, so an account one bucket ahead absorbed every simultaneous
+> request while its siblings idled. Quota is per user and so, plausibly, is any rate
+> limit — and the pool's own answer to a 429 is a five-minute bench with exponential
+> backoff, so finding that limit costs capacity we never had to spend. Concurrency is
+> therefore ranked *above* quota: quota decides who serves the next request, spare
+> capacity decides who serves the next *simultaneous* one. (Bedrock-side throttling is
+> shared — the accounts sit on one AWS account, as the cross-account cache hits prove —
+> so spreading is insurance against the per-user limit, not a way around the shared one.)
 
 An unmeasured account counts as full, so a freshly added one gets the first request
 (which produces the reading that then ranks it honestly).
@@ -151,6 +164,17 @@ failover before the first token is invisible to the client; Quick's HTTP-200
 in-stream `error` frame is caught there too. Once bytes are on the wire the stream
 belongs to the client and the error is surfaced as-is.
 
+**The failover is also the experiment.** Benching an account is a diagnosis made from
+one data point, and it is wrong whenever the failure belonged to the *request*. So when
+the next account answers the same request with the same error — compared on a
+fingerprint that strips request ids, counters and timings — the first account's bench
+and its failure streak are **withdrawn**, and the error goes to the client instead of
+to a third account. That is `observe_usage`'s rule (evidence may retract a bench it
+could have caused) applied to the other kind of evidence, and unlike a keyword list it
+needs no advance knowledge of the error: it is the general form of the incident below,
+which took two accounts down before anyone had heard of `text content blocks must be
+non-empty`.
+
 ### What benches an account
 
 | condition | effect |
@@ -167,6 +191,8 @@ a reading that reports real headroom **retracts** one:
 
 | condition | effect |
 |-----------|--------|
+| the next account fails the same way on the same request | the first account's bench and failure streak are **withdrawn** (the request was at fault) |
+| every account benched at once | the one closest to its deadline is tried **early** — a bench is a claim, a 503 is a certainty |
 | a quota deadline (`resetsAt`) further out than the cap | shortened to the cap, so the wait is a repeating half-open trial |
 | reading says ALLOWED **and** the buckets it names have room | the quota bench is lifted immediately (the failure streak is not) |
 | the same reading, but the monthly bucket is still empty (overage on) | left benched — that reading agrees with the bench |
@@ -291,6 +317,7 @@ python -m quick.usage_watch --account b --json    # one account
 | `QUICK_CREDS_DIR` | directory scanned for credential files (default: `QUICK_CREDS_FILE`'s dir) |
 | `QUICK_ACCOUNTS` | explicit account list (`default,b`), overriding discovery |
 | `QUICK_POOL_MAX_ATTEMPTS` | accounts one request may try (default 2; 1 = no failover) |
+| `QUICK_POOL_SOFT_INFLIGHT` | in-flight requests after which an account is ranked behind a freer one (2; `0` = off) |
 | `QUICK_POOL_COOLDOWN_SECONDS` | default cooldown when the backend gives no resume hint (900) |
 | `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` | cap on a quota bench, so a far-off `resetsAt` still gets a half-open trial (7200 = 2 h; `0` = obey `resetsAt` exactly) |
 | `QUICK_POOL_QUOTA_BUCKET` | ranking bucket width in percent (10) |

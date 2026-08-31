@@ -69,8 +69,12 @@ Inference binds `127.0.0.1:8000` (not public); the status page binds `0.0.0.0:90
   Requests go to the account with the most headroom left — the *tighter* of its session
   and monthly shares, since with overage off the month is what hard-blocks it (the status
   page prints which one is binding) — with failover; a
-  malformed request (400) is never retried on a second account. `/quick/pin/b/v1/messages`
-  pins one account. State files in the same dir are not mistaken for creds.
+  malformed request (400) is never retried on a second account, and a failure that
+  repeats identically on the second account **un-benches the first** (it was the request,
+  not the account). Concurrent requests are spread: an account with
+  `QUICK_POOL_SOFT_INFLIGHT` (2) in flight is ranked behind a freer one.
+  If every account is benched, the one closest to its deadline is tried early rather
+  than answering 503. `/quick/pin/b/v1/messages` pins one account. State files in the same dir are not mistaken for creds.
 - **`REFRESH_TOKEN=dummy`** in the compose only passes `main.py`'s startup check; Kiro
   routes are inert here (boot-time 401s are harmless). quick-gateway needs no Kiro creds.
 - id_token = 5-min TTL → frequent `Refreshed ... 300s` logs are NORMAL. refresh_token

@@ -1197,6 +1197,28 @@ class TestPoolSelectionSuccess:
         assert account.monthly_exhausted() is False     # so it is not benched either
         assert pool_env.select().name == "default"      # unknown counts as full
 
+    def test_concurrency_spreads_before_the_quota_ranking(self, pool_env):
+        """A burst must not all land on the best account — that is how a rate limit finds us."""
+        _reading("default", 0, monthly_used=0, units=1080)   # clearly the best account
+        _reading("b", 60, monthly_used=50, units=540)
+
+        picks = []
+        for _ in range(3):
+            account = pool_env.select()
+            picks.append(account.name)
+            pool_env.begin(account)          # left in flight, never ended
+
+        assert picks == ["default", "default", "b"]   # spare capacity wins at the cap
+
+    def test_the_cap_is_a_demotion_not_a_limit(self, pool_env):
+        """With every account at the cap the quota ranking decides, as before."""
+        _reading("default", 0, monthly_used=0, units=1080)
+        _reading("b", 60, monthly_used=50, units=540)
+        for account in pool_env.accounts():
+            account.inflight = 9
+
+        assert pool_env.select().name == "default"
+
     def test_exclude_skips_an_already_tried_account(self, pool_env):
         _reading("default", 10)
 
@@ -1279,11 +1301,50 @@ class TestPoolFailureHandling:
         assert account.status() == "cooling"
         assert account.cooldown_until - _time.time() <= 15 * 60
 
-    def test_everything_down_yields_no_candidate(self, pool_env):
+    def test_a_fully_benched_pool_still_offers_its_next_trial(self, pool_env):
+        """A bench is a claim; 503 is a certainty. With nothing left to protect, try."""
+        import time as _time
+
         for account in pool_env.accounts():
             pool_env.note_failure(account, 429, "throttled")
+        pool_env.get("default").cooldown_until = _time.time() + 9999   # b expires sooner
+
+        chosen = pool_env.select()
+
+        assert chosen is not None and chosen.name == "b"
+
+    def test_a_disabled_account_is_never_tried_early(self, pool_env):
+        """A rejected credential fails deterministically until the file is replaced."""
+        for account in pool_env.accounts():
+            pool_env.note_failure(account, 429, "throttled")
+        pool_env.get("b").disabled_reason = "credential rejected (invalid_grant)"
+
+        assert pool_env.select().name == "default"
+
+    def test_nothing_left_is_still_no_candidate(self, pool_env):
+        for account in pool_env.accounts():
+            account.disabled_reason = "credential rejected (invalid_grant)"
 
         assert pool_env.select() is None
+
+    def test_the_same_failure_on_two_accounts_absolves_the_first(self, pool_env):
+        """The failover IS the experiment: same request, same error, different account."""
+        first, second = pool_env.accounts()
+        pool_env.note_failure(first, 502, "boom (Request ID: abc123)")
+        assert first.status() == "cooling"
+
+        pool_env.absolve(first, "the same failure on account 'b'")
+
+        assert first.status() == "ready"
+        assert first.failures == 0        # the streak that doubles the next bench, too
+
+    def test_absolve_leaves_a_disabled_account_disabled(self, pool_env):
+        account = pool_env.get("default")
+        pool_env.note_failure(account, 400, "invalid_grant")
+
+        pool_env.absolve(account, "same failure elsewhere")
+
+        assert account.status() == "disabled"
 
     def test_a_recovered_account_comes_back_on_its_own(self, pool_env, monkeypatch):
         import time as _time
@@ -1513,11 +1574,57 @@ class TestRequestFailoverSuccess:
         assert final is None and error.status_code == 429
 
     @pytest.mark.asyncio
-    async def test_empty_pool_is_a_503_not_a_crash(self, pool_env, monkeypatch):
+    async def test_a_failure_that_repeats_everywhere_benches_nobody(self, pool_env,
+                                                                    monkeypatch):
+        """The shape of the empty-text-block incident, without the keyword that caught it."""
+        import quick.routes as qr
+
+        async def _gen(converse_input, account=None):
+            # Same fault on every account, with the per-request id that makes two
+            # copies of it look different.
+            yield _quick_frame("error", {"message": f"boom (Request ID: {id(account)})"})
+
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert final is None and error is not None
+        assert [a.status() for a in pool_env.accounts()] == ["ready", "ready"]
+        assert [a.failures for a in pool_env.accounts()] == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_an_account_specific_failure_still_benches_that_account(self, pool_env,
+                                                                          monkeypatch):
+        """Absolving must not blunt the normal case: different errors, real diagnosis."""
+        import quick.routes as qr
+
+        ok_frames = self._ok_stream()
+
+        async def _gen(converse_input, account=None):
+            if account.name == "default":
+                yield _quick_frame("error", {"message": "internal failure on this host"})
+                return
+            for frame in ok_frames:
+                yield frame
+
+        _reading("default", 10)
+        _reading("b", 60)
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
+                                                  pinned="", websearch=False)
+
+        assert error is None                                  # served by 'b'
+        assert pool_env.get("default").status() == "cooling"   # and 'default' benched
+
+    @pytest.mark.asyncio
+    async def test_a_dead_pool_is_an_error_not_a_crash(self, pool_env, monkeypatch):
+        """Every account disabled — the one bench a trial cannot second-guess."""
         import quick.routes as qr
 
         for account in pool_env.accounts():
-            pool_env.note_failure(account, 429, "throttled")
+            account.disabled_reason = "credential rejected (invalid_grant)"
 
         final, error = await qr._serve_aggregated({"modelId": "m"}, "msg_1", "m",
                                                   pinned="", websearch=False)

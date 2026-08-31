@@ -44,6 +44,7 @@ from loguru import logger
 from quick.auth import QuickAuthManager
 from quick.config import (
     QUICK_ACCOUNTS,
+    QUICK_POOL_SOFT_INFLIGHT,
     QUICK_CREDS_DIR,
     QUICK_CREDS_FILE,
     QUICK_CREDS_GLOB,
@@ -438,7 +439,7 @@ class QuickPool:
             a for a in self._accounts.values() if a.name not in skip and a.available(now)
         ]
         if not candidates:
-            return None
+            return self._early_trial(skip, now)
 
         # Overage decides the ORDER, never the membership: while some account still
         # has subscription headroom, a spent one is picked last — but if it is the
@@ -449,6 +450,16 @@ class QuickPool:
             with_headroom = [a for a in candidates if not a.on_overage()]
             if with_headroom:
                 candidates = with_headroom
+
+        # Spread concurrency before ranking on quota. In-flight only ever broke a tie
+        # inside one bucket, so an account a single bucket ahead absorbed every
+        # simultaneous request while its siblings idled — the shape that finds a
+        # per-account rate limit. A demotion, never a drop: if every account is at the
+        # cap this changes nothing and the quota ranking decides as before.
+        if QUICK_POOL_SOFT_INFLIGHT > 0:
+            spare = [a for a in candidates if a.inflight < QUICK_POOL_SOFT_INFLIGHT]
+            if spare:
+                candidates = spare
 
         candidates.sort(
             key=lambda a: (
@@ -465,6 +476,67 @@ class QuickPool:
             )
         )
         return candidates[0]
+
+    def _early_trial(self, skip: Set[str], now: float) -> Optional[Account]:
+        """The soonest-expiring benched account, when every account is benched.
+
+        A bench is a *claim* that an account would fail; a 503 is the certainty that
+        this request does. Once the whole pool is cooling there is nothing left to
+        protect, so the account closest to its deadline gets its half-open trial early
+        rather than the client getting a guaranteed error — and if the bench was a
+        misdiagnosis (the failure was never the account's), this is what finds out.
+        The bounded cost is one attempt against an account that may refuse; the bound
+        is :data:`QUICK_POOL_MAX_ATTEMPTS`.
+
+        A *disabled* account is still not tried: a credential Keycloak rejects fails
+        deterministically until someone re-uploads the file, so trying it would spend a
+        round-trip per request forever, and that failure already raised an alert.
+
+        Args:
+            skip: Accounts already tried for this request.
+            now: Current time.
+
+        Returns:
+            The account to try early, or ``None`` when there is genuinely nothing left.
+        """
+        benched = [a for a in self._accounts.values()
+                   if a.name not in skip and not a.disabled_reason]
+        if not benched:
+            return None
+        account = min(benched, key=lambda a: a.cooldown_until)
+        logger.warning(
+            "Quick pool: every account is benched; trying '{}' early ({}s of its "
+            "cooldown left, {}).",
+            account.name, max(0, int(account.cooldown_until - now)),
+            account.cooldown_reason or "no reason recorded",
+        )
+        return account
+
+    def absolve(self, account: Account, reason: str) -> None:
+        """Release a bench that later evidence disproved.
+
+        The pool benches an account when a request fails on it — a diagnosis made from
+        one data point, and wrong whenever the failure belonged to the *request*
+        instead. When the very next account answers the same request with the same
+        error, that is the experiment: the account was never at fault, so its bench is
+        withdrawn along with the failure it counted. This is :meth:`observe_usage`'s
+        rule (a reading may retract a bench it could have caused) applied to the other
+        kind of evidence, and it needs no list of error strings to recognise.
+
+        A disabled account is left alone: that state is not a cooldown and is cleared
+        only by a replaced credential file.
+
+        Args:
+            account: The account whose bench is being withdrawn.
+            reason: What disproved it, for the log.
+        """
+        if account.disabled_reason or not account.cooldown_until:
+            return
+        logger.info("Quick pool: releasing account '{}' — {}.", account.name, reason)
+        account.cooldown_until = 0.0
+        account.cooldown_reason = ""
+        account.cooldown_kind = ""
+        account.failures = max(0, account.failures - 1)
 
     def begin(self, account: Account) -> None:
         """Mark a request as started on ``account``."""

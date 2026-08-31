@@ -18,6 +18,7 @@ serves the same API pinned to one account, for reserved capacity or debugging.
 """
 
 import json
+import re
 import uuid
 from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 
@@ -147,6 +148,12 @@ def _pick(pinned: str, exclude: Set[str]) -> Optional[Account]:
 # six minutes of live traffic — so it is treated as a backend error and failed over.
 EMPTY_STREAM_ERROR = "Quick returned an empty stream (no events)"
 
+# Why a bench gets withdrawn: the next account answered the same request with the same
+# error, so the first account was never what was wrong. Benching it (and the failure
+# streak that doubles the next cooldown) was a misdiagnosis — and this is the general
+# form of the empty-text-block incident, which needed a keyword to catch it in advance.
+_SAME_FAILURE = "the same failure on account '{account}' — the request, not the account"
+
 
 def _should_failover(status: Optional[int], message: str) -> bool:
     """Whether a failure is worth retrying on a different account.
@@ -160,6 +167,27 @@ def _should_failover(status: Optional[int], message: str) -> bool:
     if status == 400 or "validation" in text or "improperly formed" in text:
         return False
     return True
+
+
+def _failure_fingerprint(status: Optional[int], message: str) -> str:
+    """A comparable shape for one failure, ignoring what differs between two of them.
+
+    Request ids, timings and counters make two copies of the *same* failure look
+    different, so they are stripped: what is left is the status plus the wording, which
+    is what tells "this account is in trouble" apart from "this request is".
+
+    Args:
+        status: HTTP status, when the failure had one.
+        message: The error text.
+
+    Returns:
+        A short key that equal failures share.
+    """
+    text = (message or "").lower()
+    text = re.sub(r"\b[0-9a-f]{6,}(?:-[0-9a-f]{4,})*\b", "", text)   # ids, uuids
+    text = re.sub(r"\d+", "", text)                                   # counts, timings
+    text = re.sub(r"[^a-z ]+", " ", text)
+    return f"{status}|{' '.join(text.split())[:160]}"
 
 
 def _backend_error_status(message: str) -> int:
@@ -243,6 +271,7 @@ async def _serve_aggregated(
     """
     excluded: Set[str] = set()
     status, message = 503, ""
+    blamed: Optional[Tuple[Account, str]] = None
     for _attempt in range(max(1, QUICK_POOL_MAX_ATTEMPTS)):
         account = _pick(pinned, excluded)
         if account is None:
@@ -270,7 +299,13 @@ async def _serve_aggregated(
             return None, _error_response(
                 status, message,
                 "invalid_request_error" if status == 400 else "api_error")
+        fingerprint = _failure_fingerprint(status, message)
+        if blamed is not None and blamed[1] == fingerprint:
+            # Two accounts, one request, the same error: that is about the request.
+            pool.absolve(blamed[0], _SAME_FAILURE.format(account=account.name))
+            return None, _error_response(status, message)
         pool.note_failure(account, status, message)
+        blamed = (account, fingerprint)
         excluded.add(account.name)
         logger.warning("Quick account '{}' failed ({}); trying the next account.",
                        account.name, message[:160])
@@ -364,6 +399,7 @@ async def _stream(
     """
     excluded: Set[str] = set()
     status, message = 503, ""
+    blamed: Optional[Tuple[Account, str]] = None
     for _attempt in range(max(1, QUICK_POOL_MAX_ATTEMPTS)):
         account = _pick(pinned, excluded)
         if account is None:
@@ -417,7 +453,13 @@ async def _stream(
         if not _should_failover(status, failure):
             yield _sse_error(failure, "invalid_request_error" if status == 400 else "api_error")
             return
+        fingerprint = _failure_fingerprint(status, failure)
+        if blamed is not None and blamed[1] == fingerprint:
+            pool.absolve(blamed[0], _SAME_FAILURE.format(account=account.name))
+            yield _sse_error(failure)
+            return
         pool.note_failure(account, status, failure)
+        blamed = (account, fingerprint)
         excluded.add(account.name)
         logger.warning("Quick account '{}' failed before first token ({}); "
                        "failing over.", account.name, failure[:160])

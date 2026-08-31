@@ -50,6 +50,10 @@ services:
       # Prefer the account that still has monthly units; a spent one is picked last
       # but never dropped from the pool. See quick/README.md "Overage preference".
       - QUICK_POOL_OVERAGE_POLICY=avoid
+      # Spread simultaneous requests: an account already carrying this many in-flight
+      # is ranked behind a freer one, so a burst cannot all land on the best account
+      # (quota is per user, and so, plausibly, is any rate limit). Demotion, not a cap.
+      - QUICK_POOL_SOFT_INFLIGHT=2
       # Force every request to the best authorized Opus (opus-5 is IAM-denied).
       # Exception: the "-quick" channel names litellm publishes (claude-opus-quick,
       # claude-sonnet-quick) route by their own family - see quick/README.md "Models".

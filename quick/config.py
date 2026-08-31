@@ -115,6 +115,15 @@ QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS: int = int(
 # How many accounts one request may try before giving up (1 = no failover).
 QUICK_POOL_MAX_ATTEMPTS: int = int(os.getenv("QUICK_POOL_MAX_ATTEMPTS", "2"))
 
+# Concurrency spread: an account already carrying this many in-flight requests is
+# ranked behind any account carrying fewer, whatever the quota ranking says. Quota
+# ranking alone hands a whole burst to one account (in-flight only ever broke a tie
+# *inside* a bucket), which is how a per-account rate limit gets found the hard way —
+# and the pool's own answer to a 429 is a 5-minute bench, i.e. a burst would cost
+# capacity we did not have to spend. Like the overage preference this is a demotion,
+# never a drop: with every account at the cap the ranking is unchanged. 0 = off.
+QUICK_POOL_SOFT_INFLIGHT: int = int(os.getenv("QUICK_POOL_SOFT_INFLIGHT", "2"))
+
 # ==================================================================================================
 # Public status page (read-only quota dashboard)
 # ==================================================================================================
