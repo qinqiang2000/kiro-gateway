@@ -106,7 +106,7 @@ QUICK_POOL_MAX_COOLDOWN_SECONDS: int = int(
 # one real request tests the account, and either it works (observe_usage clears the
 # rest of the bench) or it re-cools. 0 = no cap, honour resetsAt exactly.
 QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS: int = int(
-    os.getenv("QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS", "21600")
+    os.getenv("QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS", "7200")
 )
 
 # How many accounts one request may try before giving up (1 = no failover).

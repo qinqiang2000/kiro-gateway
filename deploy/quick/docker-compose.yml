@@ -42,6 +42,11 @@ services:
       - QUICK_CREDS_DIR=/home/kiro/.quickwork
       # Pool: how many accounts one request may try before giving up.
       - QUICK_POOL_MAX_ATTEMPTS=2
+      # Cap on a quota bench. Quick's own resetsAt can be weeks out; capping it means
+      # an admin raising the limit profile is noticed within 2 h (the next half-open
+      # trial) instead of at the monthly reset. Cost: a few failed first attempts a
+      # day, each of which fails over to the other account.
+      - QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS=7200
       # Prefer the account that still has monthly units; a spent one is picked last
       # but never dropped from the pool. See quick/README.md "Overage preference".
       - QUICK_POOL_OVERAGE_POLICY=avoid

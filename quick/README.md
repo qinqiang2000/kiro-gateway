@@ -137,7 +137,7 @@ belongs to the client and the error is surfaced as-is.
 | a **real failure** while the monthly bucket is spent | re-classified as a quota block → cooldown until `resetsAt` |
 | Keycloak `invalid_grant` on refresh | **disabled** + one alert — waiting never fixes it, only a re-uploaded creds file (which the pool then picks up by itself, below) |
 
-Every quota bench is capped at `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` (default 6 h), and
+Every quota bench is capped at `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` (default 2 h), and
 a reading that reports real headroom **retracts** one:
 
 | condition | effect |
@@ -264,7 +264,7 @@ python -m quick.usage_watch --account b --json    # one account
 | `QUICK_ACCOUNTS` | explicit account list (`default,b`), overriding discovery |
 | `QUICK_POOL_MAX_ATTEMPTS` | accounts one request may try (default 2; 1 = no failover) |
 | `QUICK_POOL_COOLDOWN_SECONDS` | default cooldown when the backend gives no resume hint (900) |
-| `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` | cap on a quota bench, so a far-off `resetsAt` still gets a half-open trial (21600 = 6 h; `0` = obey `resetsAt` exactly) |
+| `QUICK_POOL_MAX_QUOTA_COOLDOWN_SECONDS` | cap on a quota bench, so a far-off `resetsAt` still gets a half-open trial (7200 = 2 h; `0` = obey `resetsAt` exactly) |
 | `QUICK_POOL_QUOTA_BUCKET` | ranking bucket width in percent (10) |
 | `QUICK_POOL_AVOID_OVERAGE` | `1` to prefer accounts with monthly headroom over overage |
 

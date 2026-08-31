@@ -1127,8 +1127,8 @@ class TestPoolFailureHandling:
         waiting = account.cooldown_until - _time.time()
 
         assert account.status() == "cooling"
-        assert waiting > 4 * 3600
-        assert waiting <= 21600
+        assert waiting > 3600
+        assert waiting <= 7200
 
     def test_a_block_without_a_reset_falls_back_to_the_default_cooldown(self, pool_env):
         import time as _time
@@ -2121,7 +2121,7 @@ class TestQuotaCooldownCap:
 
         pool_env.note_failure(account, 429, "entitlement BLOCKED_MONTHLY")
 
-        assert account.cooldown_until - time.time() <= 21600
+        assert account.cooldown_until - time.time() <= 7200
         assert account.cooldown_kind == "quota"
 
     def test_a_near_reset_is_still_honoured_exactly(self, pool_env):
@@ -2143,7 +2143,7 @@ class TestQuotaCooldownCap:
 
         pool_env.note_failure(account, 429, "entitlement BLOCKED_MONTHLY")
 
-        assert account.cooldown_until - time.time() > 21600
+        assert account.cooldown_until - time.time() > 7200
 
 
 class TestFailureCrossReference:
