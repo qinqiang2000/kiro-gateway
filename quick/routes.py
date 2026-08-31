@@ -171,6 +171,14 @@ def _backend_error_status(message: str) -> int:
     # client (and litellm in front of it) already knows how to read.
     if "usage limit" in text or "entitlement" in text:
         return 429
+    # Bedrock reports a malformed request the same way it reports a real fault — an
+    # in-stream error frame under HTTP 200 — but names its own status inside the text.
+    # Reading that matters: a request Bedrock refuses fails identically everywhere, so
+    # calling it a backend fault made one bad client request fail over onto a second
+    # account and cool BOTH (seen live 2026-08-31, "text content blocks must be
+    # non-empty" took the whole pool down for minutes). 400 stops the retry.
+    if "status code: 400" in text or "validationexception" in text:
+        return 400
     return 502
 
 
@@ -259,7 +267,9 @@ async def _serve_aggregated(
             pool.end(account)
 
         if not _should_failover(status, message):
-            return None, _error_response(status, message)
+            return None, _error_response(
+                status, message,
+                "invalid_request_error" if status == 400 else "api_error")
         pool.note_failure(account, status, message)
         excluded.add(account.name)
         logger.warning("Quick account '{}' failed ({}); trying the next account.",

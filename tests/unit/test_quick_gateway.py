@@ -72,6 +72,87 @@ class TestForceModel:
         assert resolve_model("claude-sonnet-4-6") == "us.anthropic.claude-opus-4-8"
 
 
+class TestEmptyTextBlocks:
+    """Bedrock rejects an empty text block; the gateway must never send one."""
+
+    def test_empty_text_blocks_are_dropped(self):
+        req = {"model": "m", "max_tokens": 8, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": ""},
+                                         {"type": "text", "text": "hi"},
+                                         {"type": "text", "text": "   "}]},
+        ]}
+
+        out = anthropic_to_converse(req)
+
+        assert out["messages"][0]["content"] == [{"text": "hi"}]
+
+    def test_a_message_left_with_nothing_gets_a_placeholder(self):
+        # Dropping the empty block must not leave an empty message - also invalid.
+        req = {"model": "m", "max_tokens": 8, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": ""}]},
+            {"role": "assistant", "content": ""},
+        ]}
+
+        out = anthropic_to_converse(req)
+
+        assert out["messages"][0]["content"] == [{"text": "(empty placeholder)"}]
+        assert out["messages"][1]["content"] == [{"text": "(empty placeholder)"}]
+
+    def test_an_empty_tool_result_is_not_sent_empty(self):
+        req = {"model": "m", "max_tokens": 8, "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": ""},
+                {"type": "tool_result", "tool_use_id": "t2",
+                 "content": [{"type": "text", "text": ""}]},
+            ]},
+        ]}
+
+        out = anthropic_to_converse(req)
+
+        for block in out["messages"][0]["content"]:
+            assert block["toolResult"]["content"] == [{"text": "(empty placeholder)"}]
+
+    def test_real_text_is_untouched(self):
+        req = {"model": "m", "max_tokens": 8, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": " keep\n me "}]},
+        ]}
+
+        out = anthropic_to_converse(req)
+
+        assert out["messages"][0]["content"] == [{"text": " keep\n me "}]
+
+
+class TestBackendErrorStatus:
+    """A request Bedrock refuses fails identically everywhere - never fail it over."""
+
+    def test_a_bedrock_validation_error_is_a_client_error(self):
+        from quick.routes import _backend_error_status, _should_failover
+
+        msg = ("The model returned the following errors: messages: text content blocks "
+               "must be non-empty (Service: BedrockRuntime, Status Code: 400, "
+               "Request ID: a5d85377)")
+
+        assert _backend_error_status(msg) == 400
+        assert _should_failover(400, msg) is False   # so no second account is burned
+
+    def test_validation_exception_by_name(self):
+        from quick.routes import _backend_error_status
+
+        assert _backend_error_status("ValidationException: bad toolConfig") == 400
+
+    def test_a_real_backend_fault_still_fails_over(self):
+        from quick.routes import _backend_error_status, _should_failover
+
+        assert _backend_error_status("internal server error") == 502
+        assert _should_failover(502, "internal server error") is True
+
+    def test_entitlement_and_iam_are_unchanged(self):
+        from quick.routes import _backend_error_status
+
+        assert _backend_error_status("usage limit exceeded") == 429
+        assert _backend_error_status("User is not authorized to perform") == 403
+
+
 class TestChannelNames:
     """The `-quick` names litellm publishes route by family, despite the force."""
 

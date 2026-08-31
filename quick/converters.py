@@ -120,12 +120,27 @@ def _image_block(source: JsonDict) -> Optional[JsonDict]:
     return {"image": {"format": fmt, "source": {"bytes": data}}}
 
 
+# Bedrock rejects an empty text block outright: "messages: text content blocks must be
+# non-empty" (HTTP 400, seen live 2026-08-31 — and, arriving in-stream, it cost two
+# accounts a cooldown before routes.py learned to read it as a client error). A block
+# with no text carries nothing, so dropping it is an API-level fix, not a content edit
+# — but a message with no blocks at all is equally invalid, so that one needs a stand-in.
+# Deliberately NOT "Continue": kiro/converters_core.py learned the hard way that a
+# placeholder readable as a user instruction makes models answer it (upstream #171).
+EMPTY_PLACEHOLDER: str = "(empty placeholder)"
+
+
+def _has_text(block: JsonDict) -> bool:
+    """True when a converted block carries text Bedrock will accept."""
+    return bool(str(block.get("text", "")).strip())
+
+
 def _tool_result_content(content: Union[str, List[JsonDict], None]) -> List[JsonDict]:
     """Convert Anthropic tool_result content into Converse toolResult content."""
     if content is None:
-        return [{"text": ""}]
+        return [{"text": EMPTY_PLACEHOLDER}]
     if isinstance(content, str):
-        return [{"text": content}]
+        return [{"text": content}] if content.strip() else [{"text": EMPTY_PLACEHOLDER}]
     out: List[JsonDict] = []
     for block in content:
         if not isinstance(block, dict):
@@ -133,7 +148,9 @@ def _tool_result_content(content: Union[str, List[JsonDict], None]) -> List[Json
             continue
         btype = block.get("type")
         if btype == "text":
-            out.append({"text": block.get("text", "")})
+            text = block.get("text", "")
+            if str(text).strip():
+                out.append({"text": text})
         elif btype == "image":
             img = _image_block(block.get("source", {}))
             if img:
@@ -141,13 +158,13 @@ def _tool_result_content(content: Union[str, List[JsonDict], None]) -> List[Json
         else:
             # Fall back to a JSON blob for anything structured.
             out.append({"json": block})
-    return out or [{"text": ""}]
+    return out or [{"text": EMPTY_PLACEHOLDER}]
 
 
 def _content_to_converse(content: Union[str, List[JsonDict]]) -> List[JsonDict]:
     """Convert an Anthropic message ``content`` into Converse content blocks."""
     if isinstance(content, str):
-        return [{"text": content}] if content else [{"text": ""}]
+        return [{"text": content}] if content.strip() else [{"text": EMPTY_PLACEHOLDER}]
 
     blocks: List[JsonDict] = []
     for block in content:
@@ -156,7 +173,9 @@ def _content_to_converse(content: Union[str, List[JsonDict]]) -> List[JsonDict]:
             continue
         btype = block.get("type")
         if btype == "text":
-            blocks.append({"text": block.get("text", "")})
+            text = block.get("text", "")
+            if str(text).strip():
+                blocks.append({"text": text})
         elif btype == "image":
             img = _image_block(block.get("source", {}))
             if img:
@@ -195,7 +214,7 @@ def _content_to_converse(content: Union[str, List[JsonDict]]) -> List[JsonDict]:
         # Unknown block types are dropped (transparent-proxy: don't invent content).
         if _is_cached(block) and blocks and "cachePoint" not in blocks[-1]:
             blocks.append(dict(CACHE_POINT))
-    return blocks or [{"text": ""}]
+    return blocks or [{"text": EMPTY_PLACEHOLDER}]
 
 
 def _messages_to_converse(messages: List[JsonDict]) -> List[JsonDict]:
