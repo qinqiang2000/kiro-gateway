@@ -191,11 +191,17 @@ function render(d) {
       ? (a.overage_enabled ? "，已超额（overage 兜底，仍可用）" : "，已用尽") : "";
     const monthly = a.monthly_used_pct === null || a.monthly_used_pct === undefined
       ? "" : "月度已用 " + pct(a.monthly_used_pct) + units + over;
-    // Which number the pool actually ranks this account on, so a card showing "100%
-    // 会话额度剩余" while sitting at the back of the queue explains itself.
-    const rank = a.headroom_pct === null || a.headroom_pct === undefined ? ""
-      : "排序依据 " + pct(a.headroom_pct)
-        + (a.binding_allowance === "monthly" ? "（月度更紧）" : "（会话更紧）");
+    // Which number the pool actually ranks this account on. Both allowances are
+    // spelled out, because the headline above is the session one: a card reading
+    // "100% 会话额度剩余" while sitting at the back of the queue has to explain itself,
+    // and naming only the winner ("月度更紧") left the reader to guess what lost.
+    const monthlyLeft = (a.monthly_used_pct === null || a.monthly_used_pct === undefined)
+      ? null : 100 - a.monthly_used_pct;
+    const rank = (a.headroom_pct === null || a.headroom_pct === undefined) ? ""
+      : (a.binding_allowance === "monthly"
+          ? "排队按月度余量 " + pct(a.headroom_pct) + "（会话还剩 " + pct(a.session_remaining_pct) + "）"
+          : "排队按会话余量 " + pct(a.headroom_pct)
+            + (monthlyLeft === null ? "" : "（月度还剩 " + pct(monthlyLeft) + "）"));
     return '<div class="card' + (a.status === "disabled" ? " dim" : "") + '">'
       + '<div class="row"><span class="name">' + esc(a.name) + "</span>"
       + '<span class="pill ' + a.status + '">' + (label[a.status] || a.status) + "</span></div>"
