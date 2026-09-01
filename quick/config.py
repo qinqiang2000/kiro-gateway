@@ -124,6 +124,13 @@ QUICK_POOL_MAX_ATTEMPTS: int = int(os.getenv("QUICK_POOL_MAX_ATTEMPTS", "2"))
 # never a drop: with every account at the cap the ranking is unchanged. 0 = off.
 QUICK_POOL_SOFT_INFLIGHT: int = int(os.getenv("QUICK_POOL_SOFT_INFLIGHT", "2"))
 
+# How many times a stream that dies *after* the first token may be resumed on another
+# account by asking the model to continue the text already delivered. A failover is
+# only free before the first byte; past that the client owns the stream, so today's
+# alternative is an error the client answers by retrying the whole turn — which on this
+# deployment means re-reading a 200k-500k-token prefix. 0 = never resume.
+QUICK_STREAM_MAX_RESUMES: int = int(os.getenv("QUICK_STREAM_MAX_RESUMES", "2"))
+
 # ==================================================================================================
 # Public status page (read-only quota dashboard)
 # ==================================================================================================
@@ -179,6 +186,14 @@ LITELLM_USAGE_TIMEOUT: float = float(os.getenv("LITELLM_USAGE_TIMEOUT", "20"))
 # Refresh a bit before the (~5 min) access-token expiry to avoid races.
 TOKEN_REFRESH_THRESHOLD_SECONDS: int = 60
 
+# ...but a refresh inside that window runs in the *background*: the token is still
+# valid, so the request that noticed does not have to wait for a Keycloak round trip
+# (measured from the deploy box: 0.7 s typical, 2.2 s at the tail) while every other
+# request on that account queues behind the same lock. A request only blocks on the
+# refresh once the token has less than this much life left, where serving it would
+# mean serving an expired bearer.
+TOKEN_REFRESH_BLOCK_SECONDS: int = 20
+
 # Keep-alive interval (seconds) for the background Quick refresh task. The id_token
 # lives only ~5 min and is refreshed lazily on the request path, so this loop exists
 # ONLY to stop the long-lived (~90-day) refresh_token from silently lapsing when the
@@ -209,6 +224,26 @@ BEDROCK_PROXY_STREAM_PATH: str = "/integration/quick-work/bedrock-proxy-stream"
 BEDROCK_PROXY_PATH: str = "/integration/quick-work/bedrock-proxy"
 
 EVENTSTREAM_ACCEPT: str = "application/vnd.amazon.eventstream"
+
+# Hold the DataPlane connection open between requests. The tenant plane lives in
+# us-east-1 and the deploy box does not: one round trip is ~240 ms, and a cold
+# TCP+TLS handshake costs ~490 ms before the request is even sent (measured — a warm
+# connection answers the same probe in 240 ms instead of 730 ms). That half second was
+# being paid on *every* request, because streaming opened its own client each time.
+# Set to 0 to go back to a client per request, which is what the sibling Kiro pipeline
+# needs (see CLAUDE.md: a shared client there leaked CLOSE_WAIT sockets).
+QUICK_HTTP_REUSE_CONNECTIONS: bool = os.getenv(
+    "QUICK_HTTP_REUSE_CONNECTIONS", "1"
+).lower() in ("1", "true", "yes", "on")
+
+# Pool ceilings for that shared client. `max_connections` is the backstop if a stream
+# is ever abandoned without being closed: the pool refuses to grow past it rather than
+# leaking without bound.
+QUICK_HTTP_MAX_CONNECTIONS: int = int(os.getenv("QUICK_HTTP_MAX_CONNECTIONS", "100"))
+QUICK_HTTP_MAX_KEEPALIVE: int = int(os.getenv("QUICK_HTTP_MAX_KEEPALIVE", "32"))
+QUICK_HTTP_KEEPALIVE_EXPIRY: float = float(
+    os.getenv("QUICK_HTTP_KEEPALIVE_EXPIRY", "120")
+)
 # ==================================================================================================
 # Model mapping: Anthropic client model name -> Quick Bedrock inference-profile id
 # ==================================================================================================

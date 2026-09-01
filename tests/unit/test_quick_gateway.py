@@ -535,6 +535,166 @@ class TestAuthRefresh:
         assert on_disk["id_token"] == "ID1"
 
 
+class TestTokenRefreshOffTheRequestPath:
+    """A refresh due soon must not make live requests wait for Keycloak.
+
+    The round trip is ~0.7 s from the deploy box (2.2 s at the tail) and it is taken
+    under the account's lock, so doing it inline stalls every concurrent request on
+    that account, once every four minutes.
+    """
+
+    async def _loaded(self, creds_file, monkeypatch):
+        creds_file.write_text(json.dumps(_sample_blob()), encoding="utf-8")
+        import quick.auth as qa
+
+        mgr = qa.QuickAuthManager()
+        await mgr.get_credentials()      # far-future expiry: loads, refreshes nothing
+        return qa, mgr
+
+    @pytest.mark.asyncio
+    async def test_a_token_near_expiry_is_refreshed_in_the_background(self, creds_file, monkeypatch):
+        import asyncio
+
+        qa, mgr = await self._loaded(creds_file, monkeypatch)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def _slow_refresh(self, creds):
+            started.set()
+            await release.wait()
+            creds.id_token = "ID_NEW"
+            creds.id_token_expiry = time.time() + 300
+
+        monkeypatch.setattr(qa.QuickAuthManager, "_refresh", _slow_refresh)
+        mgr._creds.id_token_expiry = time.time() + 45   # inside the refresh window
+
+        served = await asyncio.wait_for(mgr.get_credentials(), timeout=1)
+
+        assert served.id_token == "ID0"                 # answered without waiting
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await mgr._refresh_task
+        assert mgr._creds.id_token == "ID_NEW"
+
+    @pytest.mark.asyncio
+    async def test_a_token_about_to_expire_is_still_waited_for(self, creds_file, monkeypatch):
+        """Below the block threshold, serving without waiting means serving a dead bearer."""
+        qa, mgr = await self._loaded(creds_file, monkeypatch)
+
+        async def _refresh(self, creds):
+            creds.id_token = "ID_NEW"
+            creds.id_token_expiry = time.time() + 300
+
+        monkeypatch.setattr(qa.QuickAuthManager, "_refresh", _refresh)
+        mgr._creds.id_token_expiry = time.time() + 5
+
+        assert (await mgr.get_credentials()).id_token == "ID_NEW"
+
+    @pytest.mark.asyncio
+    async def test_one_background_refresh_at_a_time(self, creds_file, monkeypatch):
+        import asyncio
+
+        qa, mgr = await self._loaded(creds_file, monkeypatch)
+        calls = {"n": 0}
+        release = asyncio.Event()
+
+        async def _slow_refresh(self, creds):
+            calls["n"] += 1
+            await release.wait()
+
+        monkeypatch.setattr(qa.QuickAuthManager, "_refresh", _slow_refresh)
+        mgr._creds.id_token_expiry = time.time() + 45
+
+        for _ in range(5):
+            await mgr.get_credentials()
+        await asyncio.sleep(0)
+        release.set()
+        await mgr._refresh_task
+
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_background_refresh_is_not_the_request_path_problem(
+        self, creds_file, monkeypatch
+    ):
+        qa, mgr = await self._loaded(creds_file, monkeypatch)
+
+        async def _boom(self, creds):
+            raise qa.QuickAuthError("Keycloak said no")
+
+        monkeypatch.setattr(qa.QuickAuthManager, "_refresh", _boom)
+        mgr._creds.id_token_expiry = time.time() + 45
+
+        served = await mgr.get_credentials()
+        await mgr._refresh_task                 # the task swallowed it
+
+        assert served.id_token == "ID0"
+
+
+class TestDataPlaneConnectionReuse:
+    """The tenant plane is a continent away: a cold handshake costs ~0.5 s per request."""
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self.is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            await self.aclose()
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+    @pytest.fixture
+    def built(self, monkeypatch):
+        """Record every client the module builds (httpx itself is stubbed out here)."""
+        import quick.client as qc
+
+        made = []
+
+        def _factory(*a, **k):
+            client = self._FakeClient()
+            made.append(client)
+            return client
+
+        monkeypatch.setattr(qc.httpx, "AsyncClient", _factory)
+        qc._clients.clear()
+        yield made
+        qc._clients.clear()
+
+    @pytest.mark.asyncio
+    async def test_one_client_serves_every_request(self, built, monkeypatch):
+        import quick.client as qc
+
+        monkeypatch.setattr(qc, "QUICK_HTTP_REUSE_CONNECTIONS", True)
+
+        async with qc._http_client() as first:
+            pass
+        async with qc._http_client() as second:
+            pass
+
+        assert len(built) == 1 and first is second and not first.is_closed
+        await qc.aclose_http_clients()
+        assert first.is_closed and not qc._clients
+
+    @pytest.mark.asyncio
+    async def test_reuse_can_be_turned_off(self, built, monkeypatch):
+        """The escape hatch for the CLOSE_WAIT leak the Kiro pipeline hit."""
+        import quick.client as qc
+
+        monkeypatch.setattr(qc, "QUICK_HTTP_REUSE_CONNECTIONS", False)
+
+        async with qc._http_client() as first:
+            pass
+        async with qc._http_client() as second:
+            pass
+
+        assert len(built) == 2 and first is not second
+        assert first.is_closed and second.is_closed
+
+
 class TestKeepalive:
     @pytest.mark.asyncio
     async def test_keepalive_forces_refresh_even_when_token_valid(self, creds_file, monkeypatch):
@@ -917,8 +1077,16 @@ class TestAlertDeliveryErrors:
 # ==================================================================================================
 
 def _usage_summary(session_used, monthly_used=100, resume=0, status="ALLOWED",
-                   overage=True, units=0, provisioned=720, resets_at=1788220800):
-    """Build a usageSummary exactly as the live DataPlane returns it."""
+                   overage=True, units=0, provisioned=720, resets_at=None):
+    """Build a usageSummary exactly as the live DataPlane returns it.
+
+    ``resetsAt`` defaults to a week out rather than a fixed epoch: a reading past its
+    own reset counts as unknown (that is the point of it), so a hardcoded date turns
+    every selection test into a time bomb that goes off at the month boundary — which
+    is exactly what happened on 2026-09-01.
+    """
+    if resets_at is None:
+        resets_at = int(time.time()) + 7 * 86400
     return {
         "entitlementStatus": status,
         "overageEnabled": overage,
@@ -1632,6 +1800,168 @@ class TestRequestFailoverSuccess:
         assert final is None and error.status_code == 503
 
 
+class TestStreamResumeAfterDrop:
+    """A connection that dies mid-answer is continued, not handed back as an error.
+
+    The client is already holding real text by then, so the old behaviour cost it the
+    whole turn — and a turn on this deployment re-reads a 200k-500k-token prefix.
+    """
+
+    def _dropping_converse(self, captured, first_text="Hello, ", rest_text="world."):
+        """converse_stream double: drops the connection after one text delta, then works."""
+        calls = {"n": 0}
+
+        async def _gen(converse_input, account=None):
+            calls["n"] += 1
+            captured.append(converse_input)
+            yield _quick_frame("messageStart", {"role": "assistant"})
+            if calls["n"] == 1:
+                yield _quick_frame("contentBlockDelta",
+                                   {"contentBlockIndex": 0, "delta": {"text": first_text}})
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body"
+                )
+            yield _quick_frame("contentBlockDelta",
+                               {"contentBlockIndex": 0, "delta": {"text": rest_text}})
+            yield _quick_frame("contentBlockStop", {"contentBlockIndex": 0})
+            yield _quick_frame("messageStop", {"stopReason": "end_turn"})
+            yield _quick_frame("metadata", {"usage": {"inputTokens": 7, "outputTokens": 2}})
+
+        return _gen, calls
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_stream_continues_in_the_same_message(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        captured = []
+        gen, calls = self._dropping_converse(captured)
+        monkeypatch.setattr(qr, "converse_stream", gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert calls["n"] == 2                        # it was retried
+        assert "event: error" not in body             # ...invisibly
+        assert body.count("event: message_start") == 1
+        assert body.count('"type": "content_block_start"') == 1
+        assert "Hello, " in body and "world." in body
+        assert body.count("event: message_stop") == 1
+
+    @pytest.mark.asyncio
+    async def test_the_continuation_carries_what_was_already_sent(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        captured = []
+        gen, _ = self._dropping_converse(captured, first_text="Hello, ")
+        monkeypatch.setattr(qr, "converse_stream", gen)
+
+        [c async for c in qr._stream({"modelId": "m", "messages": [{"role": "user"}]},
+                                     "msg_1", "m", "")]
+
+        # Bedrock rejects a prefill that ends in whitespace, so it is stripped.
+        assert captured[1]["messages"][-1] == {"role": "assistant",
+                                               "content": [{"text": "Hello,"}]}
+        assert captured[0]["messages"][-1]["role"] == "user"   # the original is untouched
+
+    @pytest.mark.asyncio
+    async def test_a_half_sent_tool_call_is_not_resumed(self, pool_env, monkeypatch):
+        """There is no valid prefill for half a tool call — the error is the honest answer."""
+        import quick.routes as qr
+
+        calls = {"n": 0}
+
+        async def _gen(converse_input, account=None):
+            calls["n"] += 1
+            yield _quick_frame("contentBlockStart",
+                               {"contentBlockIndex": 0,
+                                "start": {"toolUse": {"toolUseId": "t1", "name": "grep"}}})
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert calls["n"] == 1
+        assert "event: error" in body
+
+    @pytest.mark.asyncio
+    async def test_resuming_can_be_turned_off(self, pool_env, monkeypatch):
+        import quick.routes as qr
+
+        monkeypatch.setattr(qr, "QUICK_STREAM_MAX_RESUMES", 0)
+        gen, calls = self._dropping_converse([])
+        monkeypatch.setattr(qr, "converse_stream", gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert calls["n"] == 1 and "event: error" in body
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_on_the_continuation_is_not_read_as_a_finished_answer(
+        self, pool_env, monkeypatch
+    ):
+        """The block frame is the whole stream, so it must be checked on every attempt."""
+        import quick.routes as qr
+
+        calls = {"n": 0}
+
+        async def _gen(converse_input, account=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                yield _quick_frame("contentBlockDelta",
+                                   {"contentBlockIndex": 0, "delta": {"text": "hi"}})
+                raise httpx.RemoteProtocolError("peer closed connection")
+            yield _block_frame()
+
+        monkeypatch.setattr(qr, "converse_stream", _gen)
+
+        body = "".join([c async for c in qr._stream({"modelId": "m"}, "msg_1", "m", "")])
+
+        assert calls["n"] == 2
+        assert "event: error" in body and "usage limit" in body.lower()
+
+
+class TestContinuationRequest:
+    """What a resumed request asks for (:func:`quick.routes._continuation_input`)."""
+
+    def _input(self, **kw):
+        base = {"modelId": "m", "messages": [{"role": "user", "content": [{"text": "q"}]}],
+                "inferenceConfig": {"maxTokens": 1000}}
+        base.update(kw)
+        return base
+
+    def test_the_prefill_becomes_the_last_assistant_turn(self):
+        import quick.routes as qr
+
+        out = qr._continuation_input(self._input(), "half an answer ")
+
+        assert out["messages"][-1] == {"role": "assistant",
+                                       "content": [{"text": "half an answer"}]}
+
+    def test_a_client_prefill_is_extended_not_duplicated(self):
+        """Two assistant turns in a row is a request Converse rejects."""
+        import quick.routes as qr
+
+        messages = [{"role": "user", "content": [{"text": "q"}]},
+                    {"role": "assistant", "content": [{"text": "Sure:"}]}]
+        out = qr._continuation_input(self._input(messages=messages), " more")
+
+        assert len(out["messages"]) == 2
+        assert out["messages"][-1]["content"] == [{"text": "Sure:"}, {"text": " more"}]
+
+    def test_the_output_budget_shrinks_by_what_was_spent(self):
+        import quick.routes as qr
+
+        out = qr._continuation_input(self._input(), "x" * 400)
+
+        assert out["inferenceConfig"]["maxTokens"] == 900   # 1000 - ~100 tokens
+
+    def test_no_budget_left_means_no_continuation(self):
+        import quick.routes as qr
+
+        assert qr._continuation_input(self._input(inferenceConfig={"maxTokens": 10}),
+                                      "x" * 400) is None
+
+
 class TestEntitlementBlockFrame:
     """Quick refuses a blocked entitlement with its own event type, under HTTP 200."""
 
@@ -1646,7 +1976,9 @@ class TestEntitlementBlockFrame:
     def test_the_message_names_the_entitlement_units_and_reset(self, usage_state):
         from quick.streaming import backend_error
 
-        message = backend_error(self._decoded(units=0, provisioned=480))
+        # A fixed resetsAt here on purpose: this asserts how the epoch is rendered.
+        message = backend_error(self._decoded(units=0, provisioned=480,
+                                              resets_at=1788220800))
 
         assert "BLOCKED_MONTHLY" in message
         assert "monthly units 0/480" in message

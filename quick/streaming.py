@@ -20,7 +20,7 @@ Header:
 import json
 import struct
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, Iterator, List, Optional
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 
 from quick.usage_watch import observe_event
 
@@ -263,6 +263,17 @@ def _sse(event: str, data: JsonDict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _approx_tokens(text: str) -> int:
+    """Rough token count for text whose real count never arrived.
+
+    Only used for a stream that died before its ``metadata`` frame: the tokens it
+    produced are real and already delivered to the client, so reporting zero for them
+    would understate the answer's cost. ~4 chars per token is the usual English
+    approximation; nothing bills off this number.
+    """
+    return max(1, len(text) // 4) if text else 0
+
+
 def _cache_usage(usage: JsonDict) -> JsonDict:
     """Anthropic-shaped cache counters from a Converse ``usage``, omitted when zero.
 
@@ -292,13 +303,20 @@ class ConverseToAnthropicSSE:
     def __init__(self, message_id: str, model: str) -> None:
         self.message_id = message_id
         self.model = model
-        # Maps Converse contentBlockIndex -> Anthropic block type currently open.
+        # Maps Anthropic block index -> block type currently open.
         self._open_blocks: Dict[int, str] = {}
         self._input_tokens = 0
         self._cache_usage: JsonDict = {}
         self._output_tokens = 0
         self._stop_reason: Optional[str] = None
         self._started = False
+        # Resume bookkeeping (see resume_here): a continuation stream numbers its
+        # blocks from 0 again, so its indices are shifted onto the ones already sent.
+        self._index_offset = 0
+        self._max_index = -1
+        self._text_so_far = ""
+        self._non_text_seen = False
+        self._carried_output_tokens = 0
 
     def start(self) -> str:
         """Emit ``message_start``."""
@@ -329,11 +347,61 @@ class ConverseToAnthropicSSE:
 
     def _open_thinking(self, index: int) -> str:
         self._open_blocks[index] = "thinking"
+        self._non_text_seen = True
         return _sse(
             "content_block_start",
             {"type": "content_block_start", "index": index,
              "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
         )
+
+    def _index_for(self, raw_index: int, kind: str) -> Tuple[int, List[str]]:
+        """Map a Converse block index onto this message, shifted by any resume.
+
+        Returns the index to use plus any SSE that had to be emitted first. The only
+        thing that needs emitting is a ``content_block_stop``: after a resume the block
+        we are continuing is still open, so a continuation that opens a *different*
+        kind of block there (reasoning, a tool call) has to close ours and land after
+        it, taking every later block with it.
+        """
+        index = raw_index + self._index_offset
+        out: List[str] = []
+        open_kind = self._open_blocks.get(index)
+        if open_kind is not None and open_kind != kind:
+            del self._open_blocks[index]
+            out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": index}))
+            self._index_offset += 1
+            index += 1
+        self._max_index = max(self._max_index, index)
+        return index, out
+
+    def can_resume(self) -> bool:
+        """Whether a dropped stream can be continued instead of erroring out.
+
+        Only a plain-text answer can: continuing means re-asking with what was already
+        delivered as an assistant prefill, and a half-sent tool call has no valid
+        prefill, while a reasoning block cannot be replayed without its signature
+        (prefill and extended thinking do not mix).
+        """
+        return not self._non_text_seen
+
+    def resume_here(self) -> None:
+        """Re-point the translator at a continuation stream of the same message.
+
+        The client has already seen ``message_start`` and some text, so the next stream
+        must not repeat either: its block 0 is folded into the block still open here
+        (or, if that block was closed, opened after it), and its usage is added to what
+        the dropped stream had already reported.
+        """
+        open_text = sorted(i for i, kind in self._open_blocks.items() if kind == "text")
+        self._index_offset = open_text[0] if open_text else self._max_index + 1
+        self._carried_output_tokens += self._output_tokens or _approx_tokens(self._text_so_far)
+        self._output_tokens = 0
+        self._stop_reason = None
+
+    @property
+    def text_so_far(self) -> str:
+        """Every text delta emitted so far — the prefill a continuation carries."""
+        return self._text_so_far
 
     def handle(self, event: JsonDict) -> List[str]:
         """Translate one decoded Converse event into zero or more SSE strings."""
@@ -353,11 +421,13 @@ class ConverseToAnthropicSSE:
             return out
 
         if etype == "contentBlockStart":
-            index = payload.get("contentBlockIndex", 0)
             start = payload.get("start", {})
             if "toolUse" in start:
                 tu = start["toolUse"]
+                index, shift = self._index_for(payload.get("contentBlockIndex", 0), "tool_use")
+                out.extend(shift)
                 self._open_blocks[index] = "tool_use"
+                self._non_text_seen = True
                 out.append(_sse("content_block_start", {
                     "type": "content_block_start", "index": index,
                     "content_block": {"type": "tool_use", "id": tu.get("toolUseId", ""),
@@ -366,22 +436,29 @@ class ConverseToAnthropicSSE:
             return out
 
         if etype == "contentBlockDelta":
-            index = payload.get("contentBlockIndex", 0)
+            raw_index = payload.get("contentBlockIndex", 0)
             delta = payload.get("delta", {})
             if "text" in delta:
+                index, shift = self._index_for(raw_index, "text")
+                out.extend(shift)
                 if self._open_blocks.get(index) != "text":
                     out.append(self._open_text(index))
+                self._text_so_far += delta["text"]
                 out.append(_sse("content_block_delta", {
                     "type": "content_block_delta", "index": index,
                     "delta": {"type": "text_delta", "text": delta["text"]},
                 }))
             elif "toolUse" in delta:
+                index, shift = self._index_for(raw_index, "tool_use")
+                out.extend(shift)
                 out.append(_sse("content_block_delta", {
                     "type": "content_block_delta", "index": index,
                     "delta": {"type": "input_json_delta", "partial_json": delta["toolUse"].get("input", "")},
                 }))
             elif "reasoningContent" in delta:
                 rc = delta["reasoningContent"]
+                index, shift = self._index_for(raw_index, "thinking")
+                out.extend(shift)
                 if self._open_blocks.get(index) != "thinking":
                     out.append(self._open_thinking(index))
                 if "text" in rc:
@@ -397,7 +474,7 @@ class ConverseToAnthropicSSE:
             return out
 
         if etype == "contentBlockStop":
-            index = payload.get("contentBlockIndex", 0)
+            index = payload.get("contentBlockIndex", 0) + self._index_offset
             if index in self._open_blocks:
                 del self._open_blocks[index]
                 out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": index}))
@@ -427,8 +504,11 @@ class ConverseToAnthropicSSE:
             "type": "message_delta",
             "delta": {"stop_reason": self._stop_reason or "end_turn", "stop_sequence": None},
             # Converse only reports usage in its final metadata frame, so the cache
-            # counters can only ride the closing delta, not message_start.
-            "usage": {"output_tokens": self._output_tokens, **self._cache_usage},
+            # counters can only ride the closing delta, not message_start. After a
+            # resume the dropped stream never sent that frame, so what it produced is
+            # carried over as an estimate rather than silently lost.
+            "usage": {"output_tokens": self._output_tokens + self._carried_output_tokens,
+                      **self._cache_usage},
         }))
         out.append(_sse("message_stop", {"type": "message_stop"}))
         return out

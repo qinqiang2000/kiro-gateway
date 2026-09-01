@@ -22,13 +22,14 @@ import re
 import uuid
 from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from quick.auth import QuickAuthError
 from quick.client import QuickAPIError, converse_stream
-from quick.config import QUICK_POOL_MAX_ATTEMPTS, resolve_model
+from quick.config import QUICK_POOL_MAX_ATTEMPTS, QUICK_STREAM_MAX_RESUMES, resolve_model
 from quick.converters import anthropic_to_converse
 from quick.pool import Account, pool
 from quick.streaming import (
@@ -188,6 +189,54 @@ def _failure_fingerprint(status: Optional[int], message: str) -> str:
     text = re.sub(r"\d+", "", text)                                   # counts, timings
     text = re.sub(r"[^a-z ]+", " ", text)
     return f"{status}|{' '.join(text.split())[:160]}"
+
+
+def _continuation_input(
+    converse_input: Dict[str, Any], text_so_far: str
+) -> Optional[Dict[str, Any]]:
+    """Build the request that continues an answer the client has already half-received.
+
+    A dropped stream leaves the client holding real text, so the retry must not start
+    the answer over: the delivered text goes back as the final *assistant* turn, which
+    is Converse's prefill — the model continues it instead of restarting. The output
+    budget shrinks by what was already spent, so a resumed answer cannot exceed the
+    ``max_tokens`` the client asked for.
+
+    Args:
+        converse_input: The request as first sent.
+        text_so_far: Every text delta already written to the client.
+
+    Returns:
+        The continuation request, or ``None`` when there is no output budget left to
+        continue into (finishing is then the backend's business, not ours).
+    """
+    prefill = text_so_far.rstrip()   # Bedrock rejects a trailing-whitespace prefill
+    resumed = dict(converse_input)
+
+    messages = list(resumed.get("messages") or [])
+    if prefill:
+        if messages and messages[-1].get("role") == "assistant":
+            # Client-sent prefill already occupies the last turn; extend it rather than
+            # adding a second assistant message, which Converse would reject.
+            last = dict(messages[-1])
+            last["content"] = list(last.get("content") or []) + [{"text": prefill}]
+            messages[-1] = last
+        else:
+            messages.append({"role": "assistant", "content": [{"text": prefill}]})
+        resumed["messages"] = messages
+
+    config = resumed.get("inferenceConfig")
+    if isinstance(config, dict) and config.get("maxTokens"):
+        remaining = int(config["maxTokens"]) - _approx_tokens(prefill)
+        if remaining <= 0:
+            return None
+        resumed["inferenceConfig"] = {**config, "maxTokens": remaining}
+    return resumed
+
+
+def _approx_tokens(text: str) -> int:
+    """Rough token count (~4 chars each) for text whose real count never arrived."""
+    return max(1, len(text) // 4) if text else 0
 
 
 def _backend_error_status(message: str) -> int:
@@ -396,30 +445,43 @@ async def _stream(
     SSE has been written the client owns the stream and a switch of account would be
     visible as an error. Failing over *before* that point keeps a cooling-down account
     invisible to the caller.
+
+    Past that point a *dropped connection* is still recoverable: the answer so far goes
+    back to the model as a prefill and the rest is streamed into the same message
+    (:func:`_continuation_input`). The alternative — the error the client sees today —
+    costs a whole turn, and a turn here means re-reading a 200k-500k-token prefix.
     """
     excluded: Set[str] = set()
     status, message = 503, ""
     blamed: Optional[Tuple[Account, str]] = None
-    for _attempt in range(max(1, QUICK_POOL_MAX_ATTEMPTS)):
+    translator = ConverseToAnthropicSSE(message_id, model)
+    emitted = False
+    attempts, resumes = 0, 0
+    while attempts < max(1, QUICK_POOL_MAX_ATTEMPTS):
         account = _pick(pinned, excluded)
         if account is None:
             break
+        attempts += 1
         current_account.set(account.name)
-        translator = ConverseToAnthropicSSE(message_id, model)
         decoder = EventStreamDecoder()
-        emitted = False
         failure = ""
+        dropped = False
+        first_event = True
         pool.begin(account)
         try:
             async for chunk in converse_stream(converse_input, account):
                 for event in decoder.feed(chunk):
-                    if not emitted:
-                        # Quick reports backend failures as an in-stream error frame
-                        # under HTTP 200 — catch it while failing over is still free.
+                    if first_event:
+                        # Quick reports a refusal as an in-stream error frame under
+                        # HTTP 200, and that frame is the whole stream. Checked on every
+                        # attempt, not just the first: a continuation that runs into an
+                        # entitlement block must not read as a finished answer.
+                        first_event = False
                         err = backend_error(event)
                         if err:
                             failure = err
                             break
+                    if not emitted:
                         yield translator.start()
                         yield "event: ping\ndata: {\"type\": \"ping\"}\n\n"
                         emitted = True
@@ -439,6 +501,12 @@ async def _stream(
             status, failure = 401, str(exc)
         except QuickAPIError as exc:
             status, failure = (exc.status_code if exc.status_code >= 400 else 502), exc.message
+        except httpx.TransportError as exc:
+            # The connection died under us (typically "peer closed connection without
+            # sending complete message body"). Nothing was wrong with the request, so
+            # mid-stream this is the one failure worth continuing rather than reporting.
+            logger.warning("Quick stream dropped on account '{}': {}", account.name, exc)
+            status, failure, dropped = 502, f"{type(exc).__name__}: {exc}", True
         except Exception as exc:  # noqa: BLE001
             logger.exception("Quick streaming failed on account '{}'", account.name)
             status, failure = 502, str(exc)
@@ -447,6 +515,28 @@ async def _stream(
 
         message = failure
         if emitted:
+            resumed = (
+                _continuation_input(converse_input, translator.text_so_far)
+                if dropped and resumes < QUICK_STREAM_MAX_RESUMES and translator.can_resume()
+                else None
+            )
+            if resumed is not None:
+                resumes += 1
+                # A resume is not a failover: it gets its own budget of accounts. The
+                # account that dropped is passed over but not benched — a dead
+                # connection is no verdict on it — and it is taken back rather than
+                # dead-ending the stream when it is the only account there is.
+                attempts, excluded = 0, {account.name}
+                if _pick(pinned, excluded) is None:
+                    excluded = set()
+                converse_input = resumed
+                translator.resume_here()
+                logger.warning(
+                    "Quick stream dropped after {} chars on '{}'; continuing on another "
+                    "account (resume {}/{}).",
+                    len(translator.text_so_far), account.name, resumes, QUICK_STREAM_MAX_RESUMES,
+                )
+                continue
             # Too late to switch accounts — the client is mid-stream.
             yield _sse_error(failure)
             return
