@@ -45,6 +45,7 @@ from quick.config import (
     QUICK_KEEPALIVE_INTERVAL,
     QUICK_PROFILE_ID,
     QUICK_TENANT_URL,
+    TOKEN_REFRESH_BLOCK_SECONDS,
     TOKEN_REFRESH_THRESHOLD_SECONDS,
 )
 
@@ -222,6 +223,8 @@ class QuickAuthManager:
         # :meth:`file_replaced_externally`.
         self._own_mtime: float = 0.0
         self._reload_requested: bool = False
+        # A refresh started off the request path (see get_credentials).
+        self._refresh_task: Optional["asyncio.Task[None]"] = None
 
     @property
     def creds_file(self) -> Path:
@@ -372,6 +375,9 @@ class QuickAuthManager:
         creds.access_token = tok["access_token"]
         creds.access_token_expiry = now + float(tok.get("expires_in", 300))
         # id_token is the DataPlane bearer; Keycloak returns a fresh one on refresh.
+        # Assign the token BEFORE its expiry and keep it that way: get_credentials reads
+        # this object without the lock, and this order is what stops it from ever seeing
+        # a fresh expiry attached to the token that is about to be replaced.
         if tok.get("id_token"):
             creds.id_token = tok["id_token"]
             creds.id_token_expiry = now + float(tok.get("expires_in", 300))
@@ -394,7 +400,28 @@ class QuickAuthManager:
         return creds.access_token or ""
 
     async def get_credentials(self) -> QuickCredentials:
-        """Return current credentials, (re)loading and refreshing as needed."""
+        """Return current credentials, (re)loading and refreshing as needed.
+
+        A refresh needed *soon* is started in the background and the still-valid token
+        is returned at once: the Keycloak round trip is ~0.7 s (2.2 s at the tail) and
+        it is taken under the account lock, so doing it inline stalls every concurrent
+        request on that account roughly every four minutes. The caller only waits when
+        the token has less than :data:`TOKEN_REFRESH_BLOCK_SECONDS` of life left, i.e.
+        when serving it without waiting would hand the DataPlane an expired bearer.
+        """
+        creds = self._creds
+        if (
+            creds is not None
+            and not self._reload_requested
+            and not creds.is_expired(TOKEN_REFRESH_BLOCK_SECONDS)
+        ):
+            # Read without the lock: _refresh mutates this object in place, and it
+            # assigns the token before its expiry, so a concurrent reader can only ever
+            # see a token that is *older* than the expiry it reads — never the reverse.
+            if creds.is_expired():
+                self._schedule_refresh()
+            return creds
+
         async with self._lock:
             self._honour_reload()
             if self._creds is None:
@@ -402,6 +429,38 @@ class QuickAuthManager:
             if self._creds.is_expired():
                 await self._refresh(self._creds)
             return self._creds
+
+    def _schedule_refresh(self) -> None:
+        """Start a refresh off the request path, unless one is already running."""
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:       # no loop (sync caller): the next request refreshes
+            return
+        self._refresh_task = loop.create_task(self._background_refresh())
+
+    async def _background_refresh(self) -> None:
+        """Refresh under the lock, with nobody waiting on the result.
+
+        A failure here is not fatal and not the caller's problem: the token is still
+        valid for now, and the request that finds it expired refreshes inline (and
+        surfaces the error) the normal way.
+        """
+        try:
+            async with self._lock:
+                self._honour_reload()
+                if self._creds is None:
+                    self._creds = self._load()
+                if self._creds.is_expired():
+                    await self._refresh(self._creds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - background work never crashes a request
+            logger.warning(
+                "Quick auth: background refresh for '{}' failed ({}); the next request "
+                "will refresh inline.", self.name or "default", exc
+            )
 
     def _honour_reload(self) -> None:
         """Act on a pending :meth:`mark_stale` — call only while holding the lock."""

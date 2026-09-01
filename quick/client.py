@@ -18,14 +18,23 @@ the gateway routes everything through the stream path and aggregates for
 non-streaming responses.
 """
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, Optional, Tuple
 
 import httpx
 from loguru import logger
 
 from quick.auth import quick_auth_manager
-from quick.config import BEDROCK_PROXY_STREAM_PATH, EVENTSTREAM_ACCEPT
+from quick.config import (
+    BEDROCK_PROXY_STREAM_PATH,
+    EVENTSTREAM_ACCEPT,
+    QUICK_HTTP_KEEPALIVE_EXPIRY,
+    QUICK_HTTP_MAX_CONNECTIONS,
+    QUICK_HTTP_MAX_KEEPALIVE,
+    QUICK_HTTP_REUSE_CONNECTIONS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from quick.pool import Account
@@ -58,6 +67,55 @@ async def _auth(account: Optional["Account"] = None) -> Tuple[Dict[str, str], st
         "User-Agent": "quick-gateway/1.0",
     }
     return headers, creds.tenant_url
+
+
+_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+_LIMITS = httpx.Limits(
+    max_connections=QUICK_HTTP_MAX_CONNECTIONS,
+    max_keepalive_connections=QUICK_HTTP_MAX_KEEPALIVE,
+    keepalive_expiry=QUICK_HTTP_KEEPALIVE_EXPIRY,
+)
+
+# One warm client per event loop. Keyed by loop because the CLIs (usage_watch,
+# model_watch --probe) each run their own asyncio.run, and a client built on a loop
+# that has since closed cannot be used on the next one.
+_clients: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+
+
+def _shared_client() -> httpx.AsyncClient:
+    """Return this loop's keep-alive client, building it on first use."""
+    loop = asyncio.get_running_loop()
+    for dead in [lp for lp in _clients if lp.is_closed()]:
+        _clients.pop(dead, None)
+    client = _clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, limits=_LIMITS)
+        _clients[loop] = client
+    return client
+
+
+@asynccontextmanager
+async def _http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Yield the client for one DataPlane call.
+
+    Shared (and therefore warm) by default; ``QUICK_HTTP_REUSE_CONNECTIONS=0`` falls
+    back to a client per request, which closes its connection on the way out.
+    """
+    if QUICK_HTTP_REUSE_CONNECTIONS:
+        yield _shared_client()
+        return
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        yield client
+
+
+async def aclose_http_clients() -> None:
+    """Close the shared client(s) — called from the app's shutdown path."""
+    for loop, client in list(_clients.items()):
+        try:
+            await client.aclose()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("Quick: closing shared HTTP client failed: {}", exc)
+        _clients.pop(loop, None)
 
 
 def _envelope(converse_input: JsonDict) -> bytes:
@@ -98,8 +156,7 @@ async def converse_stream(
     manager = account.auth if account is not None else quick_auth_manager
     for attempt in range(2):
         headers, base = await _auth(account)
-        # Per repo gotcha: streaming needs a dedicated client per request.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        async with _http_client() as client:
             async with client.stream(
                 "POST", f"{base}{BEDROCK_PROXY_STREAM_PATH}", headers=headers, content=body
             ) as resp:

@@ -629,6 +629,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    try:
+        from quick.client import aclose_http_clients as _quick_aclose_http
+
+        await _quick_aclose_http()
+    except Exception as e:  # noqa: BLE001 - Quick backend is optional
+        logger.debug(f"Quick HTTP client close skipped: {e}")
+
     logger.info("Shutting down application...")
     try:
         await app.state.http_client.aclose()
